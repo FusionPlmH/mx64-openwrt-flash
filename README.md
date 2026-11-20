@@ -54,22 +54,25 @@ mx64info                      # 本项目的 U-Boot 才有这条命令
 判断口诀：**能 `df -h` 看到 `/overlay` 有几百 MB，就说明 OpenWrt 已经落到 NAND 上了**，
 那 `-initramfs-kernel.bin` 这一整套过渡流程你已经走完（或者根本不需要走）。
 
-## 脚本刷哪个 U-Boot？（默认 clayface 的）
+## 脚本刷哪个 U-Boot？（默认 `uboot_ng`）
 
-| 选项 | 刷什么 | 大小 | 什么时候用 |
+| 选项 | 刷什么 | 大小 | 说明 |
 |---|---|---|---|
-| **默认** | `uboot_mx64` / `uboot_mx64_small`（clayface） | 587,312 / 524,288 B | **第一次刷机**。这是 wiki 上大量机器验证过的，失败率最低 |
-| `--ng` | `uboot_ng.bin`（本项目 `mx64-uboot-ng` 编） | 598,172 B，**只能 1 MiB 分区** | 已经能用 OpenWrt 之后想换成带 `bootimg`/`flash_uboot`/TFTP 自动引导的版本 |
+| **默认** | `uboot_ng.bin`（本项目 `mx64-uboot-ng` 编） | 598,172 B，**需要 1 MiB 分区** | 带 `bootimg`/`flash_uboot`/TFTP 自动引导/诊断命令 |
+| `--clayface` | `uboot_mx64` / `uboot_mx64_small` | 587,312 / 524,288 B | wiki 上大量机器验证过的版本，保守选择 |
 
 ```sh
-sh one-shot-diag.sh --ng            # 设备上
-powershell ... scripts\00-flash.ps1 -Uboot ng    # PC 上
+sh one-shot-diag.sh                 # 设备上：刷 uboot_ng.bin
+sh one-shot-diag.sh --clayface      # 设备上：刷 clayface 的
+powershell ... scripts\00-flash.ps1 -Uboot clayface   # PC 上指定
 ```
 
-> **为什么默认不是 `uboot_ng`**：它到现在**还没有在真机上启动过**（编译、静态检查、镜像格式都验过，
-> 但没人按过电源）。第一次刷就用未验证的 bootloader，一旦起不来就只能上串口。
-> 更稳的顺序是：先刷 clayface 的 → 进 OpenWrt → 用 `flash_uboot`（TFTP + 回读 CRC 校验）
-> 换成 `uboot_ng.bin`，出问题还能用 TFTP/U 盘重来。
+两个自动保护：
+
+- `mtd0` 只有 `0x80000`（512 KiB）时，`uboot_ng.bin` 装不下 —— **默认会提示并自动改用
+  `uboot_mx64_small`**；如果你显式写了 `--ng`，则直接拒绝执行。
+- `uboot_ng.bin` 至今**没有在真机上启动过**（编译、静态检查、镜像格式、CRC 都验过，
+  但没人按过电源键）。第一次刷它请接着串口，出问题还能用 U 盘/TFTP 重来。
 
 ## 脚本已经替你做掉的判断
 
@@ -77,7 +80,7 @@ powershell ... scripts\00-flash.ps1 -Uboot ng    # PC 上
 
 | 判断项 | 依据 | 结果 |
 |---|---|---|
-| 刷哪个 U-Boot | `awk '/^mtd0:/{print $2}' /proc/mtd` | `≥ 0x100000` → `uboot_mx64`；否则 → `uboot_mx64_small` |
+| 刷哪个 U-Boot | `awk '/^mtd0:/{print $2}' /proc/mtd` + 是否 `--clayface` | 默认 `uboot_ng.bin`；分区 < 1 MiB 自动降级 `uboot_mx64_small`；`--clayface` 用 clayface 的 |
 | 要不要解锁 mtd0 | `cat /sys/block/mtdblock0/ro` | `1` → `insmod mtd-rw.ko i_want_a_brick=1` 并回读确认变成 `0`；`0` → 直接 `dd` |
 | 写还是 dd | 上一条的结论 | 解锁过 → `mtd write`；没锁 → `dd of=/dev/mtdblock0` |
 | A0 还是 B0+ | `devmem 0x18000000` 的 `0x3F00`–`0x3F03` | 只影响**之后**用哪个 initramfs 文件名（U-Boot 镜像本身不分 A0/B0+） |
@@ -166,43 +169,117 @@ scripts/
 前提只有一条：设备已经在 diagnostic mode，PC 网卡是 `192.168.1.2/24`。
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -DryRun   # 先看它要做什么
-powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1           # 真跑（默认 TFTP）
+powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -DryRun     # 先看计划
+powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Check      # 只看设备结论
+powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1             # 真刷（全程自动）
 ```
 
-`00-flash.ps1` 会自动：把 `files/` + `*.sh` 摊到一个临时目录 → 起 TFTP（同时起 HTTP 作备用）→
-连 `192.168.1.1:23` → 注入一行命令让设备跑 `one-shot-diag.sh <主传输> <备用传输>` →
-把设备输出实时打出来 → 结束后关掉服务。
+真跑时它一共 6 个阶段，屏幕上是这样的：
 
-设备端的 `one-shot-diag.sh` 自己完成：判定 A0/B0+ 和 `mtd0` 大小 → 决定刷
-`uboot_mx64` 还是 `uboot_mx64_small` → （需要时）`insmod mtd-rw.ko` 解锁 →
-下载（**先 TFTP，取不到自动换 HTTP**）→ 长度 + SHA512 校验 → 写 `mtd0` →
-回读前 64 KiB 比对。任何一步不符合预期就 `!!` 报错停下，不会乱写。
+```
+  +----------------------------------------------------------------+
+  |  Meraki MX64 / MX64W  ->  OpenWrt                               |
+  |  u-boot  +  initramfs  +  sysupgrade                            |
+  +----------------------------------------------------------------+
 
-传输方式：
+  这次的配置
+   Device     : 192.168.1.1 (telnet 23)
+   Server     : 192.168.1.2  (tftp 主 / http 备)
+   U-Boot     : uboot_ng.bin（本项目，需 1 MiB 分区）
+   Sysupgrade : 自动选最新的（按 A0/B0+ 匹配）
+   Mode       : 真刷
 
-| 命令 | 传输 | 权限 |
-|---|---|---|
-| `00-flash.ps1` | 默认 **TFTP**（主）+ HTTP（备用） | TFTP 要**管理员**（UDP 69） |
-| `00-flash.ps1 -Transport http` | HTTP（主）+ TFTP（备用） | 不需要管理员 |
+[1/6] 环境检查
+--------------------------------------------------------------------
+   [ ok ] 网卡地址 192.168.1.2 就绪
+   [ ok ] python Python 3.12.10
+   [ ok ] ssh / scp 就绪（第 6 阶段用）
+   [ ok ] 暂存 23 个文件 -> C:\...\Temp\mx64-http
 
-TFTP 起不来也不影响：脚本会提示一句，然后设备端自动回退到 HTTP。
-想只要服务、自己敲命令：
+[2/6] 启动传输服务
+--------------------------------------------------------------------
+   [ ok ] HTTP  http://192.168.1.2:8000  (pid 1234)
+   [ ok ] TFTP  tftp://192.168.1.2  (pid 5678, UDP 69)
 
-```powershell
-python scripts\70-tftp-server.py            # 服务 files/，UDP 69
-powershell -ExecutionPolicy Bypass -File scripts\01-serve-http.ps1   # 或只要 HTTP
+[3/6] 刷 U-Boot
+--------------------------------------------------------------------
+        telnet 192.168.1.1:23 ...
+   [ ok ] 已连上 diagnostic mode
+        注入 one-shot-diag.sh ...
+
+   | --------------------------------------------------------------------
+   |  [1/6] 检测设备
+   | --------------------------------------------------------------------
+   |    SoC        : 0x3F040000  ->  b0
+   |    mtd0       : 00100000 (1048576 bytes)
+   |    mtd0 RO    : 1
+   |    Target     : uboot_ng.bin (598172 bytes)
+   |    Unlock     : yes (mtd-rw.ko + mtd write)
+   | ...
+   | ==== 完成 ====
+   [ ok ] 设备侧完成，写入: uboot_ng.bin
+   [ ok ] SoC 判定: B0+（用常规镜像）
+
+[4/6] 重启并等待 initramfs 起来
+--------------------------------------------------------------------
+        reboot（U-Boot 会自动 TFTP 拉 initramfs） ...
+   [wait] initramfs ssh        [##########..........]  12s / 420s
+   [ ok ] initramfs 已启动（ssh 端口打开）
+
+[5/6] 关闭 TFTP / HTTP
+--------------------------------------------------------------------
+   [ ok ] 传输服务已停止（设备已经在 RAM 里跑系统，不再需要）
+
+[6/6] 上传并执行 sysupgrade
+--------------------------------------------------------------------
+   Image      : openwrt-25.12.6-bcm53xx-generic-meraki_mx64-squashfs.sysupgrade.bin
+   Size       : 5.9 MB
+        scp 上传到 /tmp ...
+   [ ok ] 上传完成
+        sysupgrade -n（不保留配置，全新安装） ...
+   [ ok ] sysupgrade 已下发
+   [wait] OpenWrt ssh          [###############.....]  58s / 240s
+   [ ok ] OpenWrt 已启动（ssh 端口打开）
+
+--------------------------------------------------------------------
+  完成
+--------------------------------------------------------------------
+   Elapsed    : 03:21
+   U-Boot     : uboot_ng.bin
+   Image      : openwrt-25.12.6-...sysupgrade.bin
+   Device     : 192.168.1.1
 ```
 
-设备侧手动跑一键脚本：
+各阶段说明：
+
+| 阶段 | 干什么 |
+|---|---|
+| 1 | 检查 `192.168.1.2` 在不在网卡上、python 有没有、ssh/scp 能不能用、把文件摊到临时目录 |
+| 2 | 起 TFTP（UDP 69）+ HTTP；TFTP 绑不上就提示并改走 HTTP |
+| 3 | telnet 进 diagnostic mode，注入 `one-shot-diag.sh`，实时回显设备输出 |
+| 4 | 发 `reboot`；U-Boot 起来后自己 UBI→USB→TFTP，把 initramfs 拉走 |
+| 5 | **关掉 TFTP/HTTP**（系统已经在 RAM 里跑，用不到了） |
+| 6 | scp 上传 sysupgrade → `ssh sysupgrade -n` → 等系统重启回来 |
+
+常用开关：
+
+| 开关 | 作用 |
+|---|---|
+| `-Check` | 只跑到第 3 阶段拿结论，**不写 NAND** |
+| `-SkipSysupgrade` | 刷完 U-Boot 并进 initramfs 就停（第 6 阶段跳过） |
+| `-Uboot clayface` | 改刷 clayface 的 `uboot_mx64`（默认 `uboot_ng.bin`） |
+| `-Transport http` | 不用 TFTP，省掉管理员权限 |
+| `-SysupgradeFile <路径>` | 指定 sysupgrade 镜像（默认按 A0/B0+ 自动挑 `files/` 里最新的） |
+
+设备端也能单独跑：
 
 ```sh
-sh one-shot-diag.sh                                   # 默认 tftp://192.168.1.2，失败回退 http
-sh one-shot-diag.sh tftp://192.168.1.2 http://192.168.1.2:8000
+sh one-shot-diag.sh --check      # 只看结论
+sh one-shot-diag.sh              # 刷 uboot_ng.bin（TFTP 优先，失败回退 HTTP）
+sh one-shot-diag.sh --clayface   # 刷 clayface 的
 ```
 
-> 原厂 diagnostic mode 的 busybox 不一定带 `tftp` applet。带就用 TFTP，不带会自动走 HTTP，
-> 两种都能刷。
+> 原厂 diagnostic mode 的 busybox 不一定带 `tftp` applet。带就用 TFTP，不带自动走 HTTP。
 
 ---
 

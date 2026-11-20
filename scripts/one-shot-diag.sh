@@ -1,31 +1,24 @@
 #!/bin/sh
-# MX64 一键脚本：在 diagnostic mode 的 telnet shell 里跑，自动完成
-#   检测 SoC/分区 → (按需解锁 mtd0) → 下载 → 校验 → 写入 → 回读比对
+# =============================================================================
+#  MX64 诊断模式一键刷 U-Boot（在设备的 telnet shell 里跑）
 #
-# 用法（默认 TFTP，取不到自动回退 HTTP）:
-#   cd /tmp && wget http://192.168.1.2:8000/one-shot-diag.sh
-#   sh one-shot-diag.sh
+#    sh one-shot-diag.sh                  # 默认：刷 uboot_ng.bin（本项目），TFTP 优先
+#    sh one-shot-diag.sh --check          # 只看结论，不写任何东西
+#    sh one-shot-diag.sh --clayface       # 改刷 clayface 的 uboot_mx64
+#    sh one-shot-diag.sh tftp://192.168.1.2 http://192.168.1.2:8000
 #
-#   也可以显式指定来源（第一个参数优先，第二个是备用）:
-#   sh one-shot-diag.sh tftp://192.168.1.2 http://192.168.1.2:8000
-#   sh one-shot-diag.sh http://192.168.1.2:8000
-#
-#   只看结论、什么都不写:
-#   sh one-shot-diag.sh --check
-#
-#   刷我们自己的 U-Boot（mx64-uboot-ng 编的，需要 1 MiB 分区）:
-#   sh one-shot-diag.sh --ng
-#
-# 刷完断电，然后按 README 第 7 节引导 initramfs。
-# 只写 mtd0（boot 分区），不碰其它分区。
+#  做的事：检测 -> (按需)解锁 -> 下载 -> 校验 -> 写 mtd0 -> 回读比对
+#  只写 mtd0（boot 分区），不碰其它分区。
+# =============================================================================
 
 CHECK=0
-USE_NG=0
+USE_NG=1		# 1 = 默认刷 uboot_ng.bin, 2 = 明确指定 --ng, 0 = --clayface
 POS=""
 for a in "$@"; do
 	case "$a" in
 	--check|-n|--dry-run) CHECK=1 ;;
-	--ng|--uboot-ng)      USE_NG=1 ;;
+	--ng|--uboot-ng)      USE_NG=2 ;;
+	--clayface|--stock)   USE_NG=0 ;;
 	*)                    POS="$POS $a" ;;
 	esac
 done
@@ -41,6 +34,10 @@ SHA512_NG=4a71afc6d8fdad14cc8a019656c35f33e90e7112d4a9b22cfa12f62b8ef0ca487bcaaf
 NG_SIZE=598172
 
 die() { echo "!! $*"; exit 1; }
+rule() { echo "--------------------------------------------------------------------"; }
+ok()   { echo "   [ ok ] $*"; }
+step() { echo "        $* ..."; }
+note() { echo "          $*"; }
 
 fetch_from() {	# $1 = base, $2 = 远端文件名, $3 = 本地路径；成功返回 0
 	case "$1" in
@@ -62,16 +59,21 @@ fetch_from() {	# $1 = base, $2 = 远端文件名, $3 = 本地路径；成功返�
 fetch() {	# $1 = 远端文件名, $2 = 本地路径；按 BASE1 -> BASE2 顺序试
 	for b in "$BASE1" "$BASE2"; do
 		[ -n "$b" ] || continue
-		echo "   取 $1 自 $b"
+		note "来源 $b"
 		if fetch_from "$b" "$1" "$2" && [ -s "$2" ]; then
 			return 0
 		fi
-		echo "   失败，换下一个来源"
+		note "  取不到，换下一个来源"
 	done
 	die "取不到 $1（$BASE1 和 $BASE2 都失败）"
 }
 
-echo "==== 1/6 检测设备 ===="
+# --------------------------------------------------------------- 1. 检测
+echo
+rule
+echo " [1/6] 检测设备"
+rule
+
 raw=""
 if command -v devmem >/dev/null 2>&1; then
 	raw=$(devmem 0x18000000 2>/dev/null)
@@ -85,116 +87,158 @@ if [ -n "$raw" ]; then
 	*) VARIANT=b0 ;;
 	esac
 else
-	rev="unknown"
+	rev="读不到"
 	VARIANT=unknown
 fi
+
 mtd0size=$(awk '/^mtd0:/ {print $2}' /proc/mtd)
 ro=$(cat /sys/block/mtdblock0/ro 2>/dev/null)
 [ -n "$mtd0size" ] || die "读不到 /proc/mtd 里的 mtd0，先手动确认（不要继续）"
 mtd0dec=$((0x$mtd0size))
-echo "   chip 0x18000000 = $rev -> ${VARIANT}"
-echo "   mtd0 size       = $mtd0size ($mtd0dec bytes)"
-echo "   mtd0 read-only  = ${ro:-unknown}"
 
-if [ "$USE_NG" = "1" ]; then
-	if [ "$mtd0dec" -lt 1048576 ]; then
-		die "uboot_ng.bin 有 $NG_SIZE 字节，装不进 $mtd0size 的 boot 分区。这台机器只能先用 uboot_mx64_small 走 README 第 6 节"
+echo "   SoC        : $rev  ->  $VARIANT"
+echo "   mtd0       : $mtd0size ($mtd0dec bytes)"
+echo "   mtd0 RO    : ${ro:-?}"
+
+# --------------------------------------------------------------- 2. 决策
+if [ "$mtd0dec" -lt 1048576 ]; then
+	if [ "$USE_NG" = "2" ]; then
+		die "uboot_ng.bin 有 $NG_SIZE 字节，装不进 $mtd0size 的 boot 分区。这台机器只能先用 clayface 的 uboot_mx64_small（README 第 6 节）"
 	fi
-	TARGET=uboot_ng.bin; EXP_SHA512=$SHA512_NG; EXP_SIZE=$NG_SIZE
-elif [ "$mtd0dec" -ge 1048576 ]; then
-	TARGET=uboot_mx64; EXP_SHA512=$SHA512_MX64; EXP_SIZE=587312
-else
 	TARGET=uboot_mx64_small; EXP_SHA512=$SHA512_SMALL; EXP_SIZE=524288
+	echo "   ! 分区只有 $mtd0size，uboot_ng 装不下 -> 自动改用 uboot_mx64_small"
+elif [ "$USE_NG" -ge 1 ]; then
+	TARGET=uboot_ng.bin; EXP_SHA512=$SHA512_NG; EXP_SIZE=$NG_SIZE
+else
+	TARGET=uboot_mx64; EXP_SHA512=$SHA512_MX64; EXP_SIZE=587312
 fi
 NEED_UNLOCK=no
 [ "$ro" = "1" ] && NEED_UNLOCK=yes
-echo "   决定: TARGET=$TARGET NEED_UNLOCK=$NEED_UNLOCK"
 
+echo "   Target     : $TARGET ($EXP_SIZE bytes)"
+if [ "$NEED_UNLOCK" = "yes" ]; then
+	echo "   Unlock     : yes (mtd-rw.ko + mtd write)"
+else
+	echo "   Unlock     : no (dd)"
+fi
+
+# --------------------------------------------------------------- --check
 if [ "$CHECK" = "1" ]; then
 	echo
-	echo "==== --check：只看结论，什么都没写 ===="
+	rule
+	echo " --check：只看结论，什么都没写"
+	rule
 	case "$VARIANT" in
-	a0) echo "  SoC      : A0  -> initramfs 用 openwrt-bcm53xx-generic-meraki_mx64-a0-initramfs.bin（U-Boot 镜像本身不分 A0/B0+）" ;;
-	b0) echo "  SoC      : B0+ -> initramfs 用 openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin" ;;
-	*)  echo "  SoC      : 读不到（devmem/devmem2 都没有）；先确认标签/年份再动手" ;;
+	a0) echo "   initramfs : openwrt-bcm53xx-generic-meraki_mx64-a0-initramfs.bin" ;;
+	b0) echo "   initramfs : openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin" ;;
+	*)  echo "   initramfs : 读不到 SoC，靠标签确认 A0 / B0+" ;;
 	esac
-	echo "  mtd0     : $mtd0size ($mtd0dec 字节)"
-	echo "  刷哪个   : $TARGET ($EXP_SIZE 字节, 会用内嵌 SHA512 校验)"
-	if [ "$NEED_UNLOCK" = "yes" ]; then
-		echo "  解锁     : 需要（insmod mtd-rw.ko i_want_a_brick=1），之后用 mtd write"
-	else
-		echo "  解锁     : 不需要，直接 dd 到 /dev/mtdblock0"
-	fi
 	if [ "$TARGET" = "uboot_mx64_small" ]; then
-		echo "  后续     : 512 KiB 分区 -> 还要走第 6 节（过渡固件换 1 MiB 布局）"
+		echo "   Next      : 512 KiB 分区 -> 还要走 README 第 6 节（过渡固件换 1 MiB 布局）"
 	elif [ "$TARGET" = "uboot_ng.bin" ]; then
-		echo "  后续     : 断电后引导 openwrt-bcm53xx-...-initramfs.bin（第 7 节）；"
-		echo "             这是本项目编的 U-Boot，功能多但没在真机上验证过"
+		echo "   Next      : 重启后 U-Boot 自动 TFTP 拉 initramfs（第 7 节）"
+		echo "               uboot_ng.bin 是本项目编的，功能多但没在真机上验证过"
 	else
-		echo "  后续     : 断电后直接引导 openwrt-bcm53xx-...-initramfs.bin（第 7 节），不需要过渡固件"
+		echo "   Next      : 断电后引导 openwrt-bcm53xx-...-initramfs.bin（第 7 节）"
 	fi
 	echo
-	echo "确认无误后去掉 --check 再跑一次就会写入。"
+	note "去掉 --check 再跑一次就会真正写入"
 	exit 0
 fi
 
-echo "==== 2/6 下载 $TARGET ===="
+# --------------------------------------------------------------- 3. 下载
+echo
+rule
+echo " [2/6] 下载 $TARGET"
+rule
 cd /tmp || die "进不去 /tmp"
 rm -f "$TARGET"
-
 fetch "$TARGET" "/tmp/$TARGET"
+ok "已下载 $(wc -c < "/tmp/$TARGET") 字节"
 
-echo "==== 3/6 校验 ===="
+# --------------------------------------------------------------- 4. 校验
+echo
+rule
+echo " [3/6] 校验"
+rule
 size=$(wc -c < "/tmp/$TARGET")
-echo "   大小 $size (期望 $EXP_SIZE)"
-[ "$size" = "$EXP_SIZE" ] || die "大小不对，停止（文件可能没下全）"
+echo "   长度 $size / 期望 $EXP_SIZE"
+[ "$size" = "$EXP_SIZE" ] || die "长度不符，停止（文件没下全？）"
 if command -v sha512sum >/dev/null 2>&1; then
 	got=$(sha512sum "/tmp/$TARGET" | awk '{print $1}')
-	[ "$got" = "$EXP_SHA512" ] || die "SHA512 不匹配，停止"
-	echo "   SHA512 正确"
+	if [ "$got" != "$EXP_SHA512" ]; then
+		echo "   实际 $got"
+		die "SHA512 不匹配，停止"
+	fi
+	ok "SHA512 正确"
 else
-	echo "   (设备没有 sha512sum，只做了长度校验)"
+	note "设备没有 sha512sum，只做了长度校验"
 fi
 
+# --------------------------------------------------------------- 5. 解锁
+echo
+rule
+echo " [4/6] mtd0 写保护"
+rule
 if [ "$NEED_UNLOCK" = "yes" ]; then
-	echo "==== 4/6 解锁 mtd0 ===="
 	fetch mtd-rw.ko /tmp/mtd-rw.ko
 	fetch mtd /tmp/mtd
 	chmod +x /tmp/mtd
+	step "insmod mtd-rw.ko i_want_a_brick=1"
 	insmod /tmp/mtd-rw.ko i_want_a_brick=1
-	dmesg | tail -3
+	dmesg | tail -3 | while read -r l; do note "$l"; done
 	ro=$(cat /sys/block/mtdblock0/ro 2>/dev/null)
-	if [ "$ro" != "0" ]; then
-		die "解锁失败（mtd0 ro=$ro），不要继续。检查 dmesg 里有没有 _mtd-rw: mtd0: setting writeable flag_"
-	fi
-	echo "   mtd0 ro=0，已解锁"
+	[ "$ro" = "0" ] || die "解锁失败（mtd0 ro=$ro），不要继续。检查 dmesg 有没有 _mtd-rw: mtd0: setting writeable flag_"
+	ok "已解锁（mtd0 ro=0）"
 else
-	echo "==== 4/6 不需要解锁 ===="
+	ok "不需要解锁（mtd0 ro=${ro:-0}）"
 fi
 
-echo "==== 5/6 写入 mtd0 ===="
+# --------------------------------------------------------------- 6. 写入
+echo
+rule
+echo " [5/6] 写入 mtd0"
+rule
 if [ "$NEED_UNLOCK" = "yes" ]; then
+	step "mtd write /tmp/$TARGET /dev/mtd0"
 	/tmp/mtd write "/tmp/$TARGET" /dev/mtd0 || die "mtd write 失败"
 else
-	dd if="/tmp/$TARGET" of=/dev/mtdblock0 || die "dd 失败"
+	step "dd if=/tmp/$TARGET of=/dev/mtdblock0"
+	dd if="/tmp/$TARGET" of=/dev/mtdblock0 2>/dev/null || die "dd 失败"
 fi
 sync
+ok "写入完成"
 
-echo "==== 6/6 回读比对前 64 KiB ===="
+# --------------------------------------------------------------- 7. 回读
+echo
+rule
+echo " [6/6] 回读比对（前 64 KiB）"
+rule
 a=$(dd if=/dev/mtdblock0 bs=1024 count=64 2>/dev/null | md5sum 2>/dev/null | awk '{print $1}')
 b=$(dd if="/tmp/$TARGET" bs=1024 count=64 2>/dev/null | md5sum 2>/dev/null | awk '{print $1}')
-echo "   nand: ${a:-n/a}"
-echo "   file: ${b:-n/a}"
+echo "   nand : ${a:-n/a}"
+echo "   file : ${b:-n/a}"
 if [ -n "$a" ] && [ -n "$b" ] && [ "$a" != "$b" ]; then
 	die "回读和文件不一致！不要断电，重新跑一次本脚本"
 fi
+ok "回读一致"
 
+# --------------------------------------------------------------- 完成
 echo
-echo "==== 完成 ===="
-echo "现在断电。下一步（不按 reset，见 README 第 7 节）:"
+rule
+echo " 完成"
+rule
+echo "   Target    : $TARGET"
 case "$VARIANT" in
-a0) echo "  initramfs 文件名: openwrt-bcm53xx-generic-meraki_mx64-a0-initramfs.bin" ;;
-*)  echo "  initramfs 文件名: openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin" ;;
+a0) echo "   initramfs : openwrt-bcm53xx-generic-meraki_mx64-a0-initramfs.bin" ;;
+*)  echo "   initramfs : openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin" ;;
 esac
-[ "$TARGET" = "uboot_mx64_small" ] && echo "  刷的是 small 版 -> 先走过渡固件（README 第 6 节）"
-[ "$TARGET" = "uboot_ng.bin" ] && echo "  刷的是本项目 U-Boot -> 之后可以用 flash_uboot 走 TFTP 升级（第 11 节）"
+if [ "$TARGET" = "uboot_mx64_small" ]; then
+	echo "   Next      : 断电 -> 过渡固件（README 第 6 节）"
+elif [ "$TARGET" = "uboot_ng.bin" ]; then
+	echo "   Next      : 重启后 U-Boot 自动 TFTP 拉 initramfs；之后可用 flash_uboot 升级（第 11 节）"
+else
+	echo "   Next      : 断电 -> 引导 initramfs（README 第 7 节）"
+fi
+rule
+echo "==== 完成 ===="
