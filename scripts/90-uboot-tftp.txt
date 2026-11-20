@@ -109,7 +109,7 @@ U-Boot 里用 TFTP 升级 bootloader / 引导 initramfs（不用按 reset、不�
 7) 常用排错
 
    ping 不通          -> 网线是不是插在 LAN 口、PC 防火墙、ipaddr/serverip 是不是对
-   TFTP timeout       -> PC 上 TFTP 服务器没起（或没管理员权限导致绑不上 UDP 69）
+   TFTP timeout       -> PC 上 TFTP 服务器没起，或 UDP 69 被别的进程占用 / 被防火墙拦
    Bad Bootkernel magic / No FIT/uImage/SPIM magic
                       -> 文件不对或没传完整，重新传
    VERIFY FAILED      -> NAND 写坏了，重新跑 flash_uboot；反复失败就别再刷
