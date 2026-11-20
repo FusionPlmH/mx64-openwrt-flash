@@ -390,22 +390,48 @@ U-Boot 用 `bootm ${loadaddr}#${config_dts}` 启动，而装进 NAND 的 FIT 里
 **只有 `config@4`（B0+）或只有 `config@2`（A0）**，取决于你刷的 sysupgrade 镜像。
 `config_dts` 选错就是无限次掉回 USB/TFTP，永远进不了装好的系统。
 
-老版本 U-Boot 里这段是坏的：
+判断 SoC 版本的 C 代码一直是对的：
 
 ```c
-soc_dtscheck=...; getsocrev; if test $? = 1; then setenv config_dts config@4;
-                              else setenv config_dts config@2; fi
+uint32_t regData = __raw_readl(0x18000000);
+uint32_t tmp = (regData & 0x000F0000) >> 16;
+if (4 <= tmp) return 1;      /* B0+ */
+else          return 0;      /* A0  */
 ```
 
-`$?` 在 U-Boot 的 hush 里拿不到命令返回值，所以永远走 `else` → 永远 A0。
-v3 起改成 `soc_dtscheck=if test -z "${config_dts}"; then getsocrev set; fi`，
-由 `getsocrev set` 自己 `setenv`。
+坏的是**包在它外面的两个 U-Boot shell 陷阱**，它们让正确的 C 代码永远执行不到：
 
-> **实测提醒**：在这一台（`0x3F05CF1E`，rev 5，B0+）上，即使换了 v3 的
-> `getsocrev set`，空环境时它仍然选了 `config@2`。所以**不要指望自动探测**，
-> 直接把 `config_dts=config@4` 写进环境（就是 `files/uboot-env.bin` 干的事）。
-> 真正的根因（`__raw_readl(0x18000000)` 在 U-Boot 里读到的值，还是 `setenv` 在
-> `run` 链里不生效）要接串口看 `mx64info` 才能定位。
+```c
+/* 原版：hush 拿不到命令返回值，$? 永远不是 1 */
+soc_dtscheck=...; getsocrev; if test $? = 1; then ... config@4; else ... config@2; fi
+
+/* 只修了一半：变量为空时 hush 把整个引号参数丢掉，
+   于是 test 只剩 "-z" 两个参数，而 common/cmd_test.c 里
+       if (argc < 3) return 1;        // 返回 1 = 假
+   导致 then 分支永远不执行，config_dts 一直是空的 */
+soc_dtscheck=if test -z "${config_dts}"; then getsocrev set; fi
+```
+
+**v4 的写法**：把判断挪进 C，shell 里无条件调用。
+
+```
+soc_dtscheck=getsocrev set
+```
+
+```c
+if (argc >= 2 && !strcmp(argv[1], "set")) {
+        const char *cur = getenv("config_dts");
+        if (cur && *cur) return 0;          /* 已有值就不覆盖 */
+        setenv("config_dts", b0 ? "config@4" : "config@2");
+}
+```
+
+教训：**U-Boot 的 `test` 在参数不足时静默返回假**，不会报错。任何"变量为空"
+的判断在这种 shell 里都不可靠。v4 起即使环境被完全擦除，U-Boot 也能自己认对 SoC
+版本（已在真机上把 `u-boot-env` 擦成全 0xFF 验证：零 TFTP 请求、直接从 UBI 启动）。
+
+`files/uboot-env.bin` 里仍然带 `config_dts=config@4`，那是给老版本 U-Boot 兜底用的��
+v4 下不影响（C 代码看到已有值就不覆盖）。
 
 ## 参考
 
