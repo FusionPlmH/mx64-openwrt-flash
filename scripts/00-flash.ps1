@@ -204,6 +204,88 @@ if ($SkipSysupgrade) {
     Ok 'ssh / scp 就绪（第 6 阶段用）'
 }
 
+# ---- python 版本（http.server --directory 要 3.7+）----
+$pyVerTxt = (& python --version 2>&1) -join ' '
+$pyM = [regex]::Match($pyVerTxt, '(\d+)\.(\d+)')
+if ($pyM.Success) {
+    $pyMajor = [int]$pyM.Groups[1].Value
+    $pyMinor = [int]$pyM.Groups[2].Value
+    if ($pyMajor -lt 3 -or ($pyMajor -eq 3 -and $pyMinor -lt 7)) {
+        Bad "python $pyMajor.$pyMinor 太老（http.server 的 --directory 需要 3.7+）"
+        throw 'python 版本过低'
+    }
+    Ok "python $pyMajor.$pyMinor 可用"
+}
+
+# ---- 权限 / 防火墙：U-Boot 只会 TFTP，入站 UDP 69 被拦就拉不到镜像 ----
+$isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)
+if ($isAdmin) { Ok '以管理员运行' }
+else { Note '  非管理员运行（Windows 上绑 UDP 69 不需要管理员，一般没问题）' }
+
+$nicAlias = ($hasIp | Select-Object -First 1).InterfaceAlias
+if ($nicAlias) {
+    $prof = Get-NetConnectionProfile -InterfaceAlias $nicAlias -ErrorAction SilentlyContinue
+    if ($prof) {
+        if ($prof.NetworkCategory -eq 'Public') {
+            Warn "$nicAlias 是「公用网络」配置 -> Windows 防火墙可能拦入站 TCP/UDP"
+            Note '  症状：设备 telnet/HTTP 连不上，或 U-Boot 的 TFTP 收不到回复'
+            Note '  处理：把该网卡改成「专用」，或临时放行 python.exe'
+        } else {
+            Ok "$nicAlias 防火墙配置 = $($prof.NetworkCategory)"
+        }
+    }
+}
+
+# ---- 端口占用：上一轮没退干净的 python 服务会让本轮第 2 阶段直接失败 ----
+$busy = @()
+$udp69 = @(Get-NetUDPEndpoint -LocalPort 69 -ErrorAction SilentlyContinue)
+if ($udp69.Count -gt 0) { $busy += "UDP 69 被 pid $((($udp69 | Select-Object -ExpandProperty OwningProcess) -join ',')) 占用（TFTP）" }
+$tcpPort = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
+if ($tcpPort.Count -gt 0) { $busy += "TCP $Port 被 pid $((($tcpPort | Select-Object -ExpandProperty OwningProcess) -join ',')) 占用（HTTP）" }
+if ($busy.Count -gt 0) {
+    Bad '端口已被占用：'
+    foreach ($b in $busy) { Note "  $b" }
+    Note '多半是上一轮留下的 python 服务。先清理：'
+    Note '  Get-CimInstance Win32_Process -Filter "Name=''python.exe''" | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }'
+    throw '端口被占用'
+}
+Ok "端口空闲（UDP 69 / TCP $Port）"
+
+# ---- 本地镜像完整性：避免刷进旧版本或下坏的镜像 ----
+$sidecars = @(Get-ChildItem $filesDir -File | Where-Object { $_.Name -match '\.sha(256|512)$' })
+$badSum = @()
+foreach ($sc in $sidecars) {
+    $tgt = Join-Path $filesDir $sc.BaseName
+    if (-not (Test-Path $tgt)) { $badSum += "$($sc.Name) 对应的 $($sc.BaseName) 不存在"; continue }
+    $alg = if ($sc.Extension -eq '.sha256') { 'SHA256' } else { 'SHA512' }
+    $want = (((Get-Content $sc.FullName -Raw) -split '\s+') | Where-Object { $_ }) | Select-Object -First 1
+    $got = (Get-FileHash $tgt -Algorithm $alg).Hash
+    if ($got -ne $want.ToUpper()) { $badSum += "$($sc.BaseName) $alg 不符" }
+}
+if ($badSum.Count -gt 0) {
+    Bad '镜像校验失败：'
+    foreach ($b in $badSum) { Note "  $b" }
+    throw '镜像损坏或版本不符'
+}
+Ok ("{0} 个镜像的校验和都对得上" -f $sidecars.Count)
+
+# ---- U-Boot 版本标记：一眼确认刷进去的是哪个构建 ----
+$ngPath = Join-Path $filesDir 'uboot_ng.bin'
+if (Test-Path $ngPath) {
+    $ngBytes = [System.IO.File]::ReadAllBytes($ngPath)
+    $ngTxt = [System.Text.Encoding]::ASCII.GetString($ngBytes)
+    $tagM = [regex]::Match($ngTxt, 'mx64-ng-[0-9a-zA-Z\.\-]+')
+    $tag = if ($tagM.Success) { $tagM.Value } else { '（没找到 tag）' }
+    KeyVal 'U-Boot 版本' ("$tag, {0:N0} 字节" -f $ngBytes.Length)
+    if (-not $tagM.Success) { Warn 'uboot_ng.bin 里没有 mx64-ng tag，这镜像可能不是本项目构建的' }
+}
+
+# ---- 磁盘空间（暂存要 ~35 MB）----
+$freeMB = [math]::Round((Get-PSDrive C).Free / 1MB)
+if ($freeMB -lt 200) { Warn "C 盘只剩 $freeMB MB，暂存镜像可能失败" }
+else { Ok "C 盘剩余 $freeMB MB" }
+
 $stage = Join-Path $env:TEMP 'mx64-http'
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory $stage | Out-Null
@@ -259,17 +341,27 @@ try {
         Bad "telnet 端口 $DeviceIp`:23 连不上"
         Write-Host ''
         $probes = @(
-            @{ ip = $DeviceIp;     port = 80; hint = '设备在正常启动的原厂固件里（不是 diagnostic mode）' },
-            @{ ip = $DeviceIp;     port = 22; hint = '设备可能在跑 OpenWrt' },
+            @{ ip = $DeviceIp;     port = 80; hint = '80 开着（LuCI/OpenWrt，或原厂固件的管理页面 —— 都不是 diagnostic mode）' },
+            @{ ip = $DeviceIp;     port = 22; hint = '设备已经在跑 OpenWrt（不是 diagnostic mode）' },
             @{ ip = '192.168.0.1'; port = 23; hint = '原厂固件 LAN 默认地址是 192.168.0.1' },
             @{ ip = '192.168.0.1'; port = 80; hint = '原厂固件 LAN 默认地址是 192.168.0.1' }
         )
         $found = $false
+        $looksInstalled = $false
         foreach ($p in $probes) {
             if (Test-Port -IP $p.ip -PortNo $p.port -Ms 800) {
                 $found = $true
                 Warn ("但是 {0}:{1} 是通的 -> {2}" -f $p.ip, $p.port, $p.hint)
+                if ($p.ip -eq $DeviceIp -and $p.port -eq 22) { $looksInstalled = $true }
             }
+        }
+        if ($looksInstalled) {
+            Write-Host ''
+            Ok "$DeviceIp`:22 开着，说明 OpenWrt 已经装好了 —— 这个脚本没事可做"
+            Note '如果只是想确认系统状态：ssh root@192.168.1.1'
+            Note '如果是要换 U-Boot：mtd0 在 OpenWrt 下是只读的，得让 U-Boot 自己刷自己 ——'
+            Note '  见 README「mtd0 写不进去时，改 U-Boot 环境」和「需要刷 mtd0 时：让 U-Boot 自己刷自己」'
+            throw "OpenWrt 已安装，跳过刷机"
         }
         if (-not $found) {
             $arp = arp -a 2>$null | Select-String -SimpleMatch $DeviceIp

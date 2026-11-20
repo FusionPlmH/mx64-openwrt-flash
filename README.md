@@ -107,13 +107,44 @@ powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Probe      # 只�
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1             # 真刷（默认 TFTP）
 ```
 
-TFTP 要管理员权限（UDP 69）。不想提权就加 `-Transport http`，设备端会走 HTTP。
+TFTP 会**无条件启动**（刷完重启后是 U-Boot 去拉 initramfs，而 U-Boot 只会 TFTP）。
+Windows 上绑 UDP 69 不需要管理员权限，但网卡若在「公用网络」配置下，防火墙可能拦入站。
+`-Transport` 只决定 diag 模式里设备用哪种方式下载。
+
+### [1] 环境检查查什么
+
+跑之前先把这些挑出来，省得刷到一半才发现：
+
+| 检查 | 为什么 |
+|---|---|
+| 本机有 `192.168.1.2` 这个地址 | 没地址设备连不上，脚本会给出 `New-NetIPAddress` 的命令 |
+| python >= 3.7 | `http.server --directory` 需要 3.7 |
+| ssh / scp 存在 | 第 6 阶段要用；没有就自动跳过 sysupgrade |
+| 是否管理员 | Windows 绑 UDP 69 **不需要**管理员，只是提示 |
+| 网卡防火墙配置 | 若是「公用网络」会警告 —— U-Boot 的 TFTP 回复可能被拦 |
+| **UDP 69 / TCP 8000 是否被占用** | 上一轮没退干净的 python 服务会让第 2 阶段直接失败 |
+| **`files/` 里所有镜像的校验和** | 逐个比对 `*.sha256` / `*.sha512`，防止刷进旧版本或下坏的镜像 |
+| **U-Boot 版本 tag** | 从 `uboot_ng.bin` 里抓 `mx64-ng-*`，一眼确认刷的是哪个构建 |
+| C 盘剩余空间 | 暂存要 ~35 MB |
+
+第 3 阶段连不上 telnet 时也会自动探测：
+
+```
+[ !  ] 但是 192.168.1.1:80 是通的 -> 80 开着（LuCI/OpenWrt，或原厂固件的管理页面 —— 都不是 diagnostic mode）
+[ !  ] 但是 192.168.1.1:22 是通的 -> 设备已经在跑 OpenWrt（不是 diagnostic mode）
+
+[ ok ] 192.168.1.1:22 开着，说明 OpenWrt 已经装好了 —— 这个脚本没事可做
+        如果只是想确认系统状态：ssh root@192.168.1.1
+        如果是要换 U-Boot：mtd0 在 OpenWrt 下是只读的，得让 U-Boot 自己刷自己
+```
+
+还会顺带查 `192.168.0.1`（原厂固件的默认 LAN 地址），提示你把网线插对。
 
 ### 6 个阶段
 
 | 阶段 | 干什么 |
 |---|---|
-| [1] 环境检查 | 网卡地址 / python / ssh+scp / 暂存 `files/` |
+| [1] 环境检查 | 见上表 |
 | [2] 起服务 | TFTP(UDP 69) + HTTP 备用 |
 | [3] 刷 U-Boot | telnet 进设备，逐条发命令：能力探测 → 读 `mtd0`/写保护/SoC → 决定刷哪个 → 设备 `wget` 下载 → PC 比对长度和 md5 → （按需）`insmod mtd-rw.ko` 解锁 → `dd` 或 `mtd write` → 回读前 64 KiB 比对 |
 | [4] 重启 | 发 `reboot`，U-Boot 自动 UBI→USB→TFTP 拉 initramfs，等 22 端口 |
