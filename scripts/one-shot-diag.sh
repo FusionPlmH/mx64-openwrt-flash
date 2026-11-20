@@ -2,28 +2,53 @@
 # MX64 一键脚本：在 diagnostic mode 的 telnet shell 里跑，自动完成
 #   检测 SoC/分区 → (按需解锁 mtd0) → 下载 → 校验 → 写入 → 回读比对
 #
-# 用法:
+# 用法（默认 TFTP，取不到自动回退 HTTP）:
 #   cd /tmp && wget http://192.168.1.2:8000/one-shot-diag.sh
+#   sh one-shot-diag.sh
+#
+#   也可以显式指定来源（第一个参数优先，第二个是备用）:
+#   sh one-shot-diag.sh tftp://192.168.1.2 http://192.168.1.2:8000
 #   sh one-shot-diag.sh http://192.168.1.2:8000
 #
-#   TFTP 方式（需要 busybox 带 tftp，且 PC 上跑 70-tftp-server.py）:
-#   sh one-shot-diag.sh tftp://192.168.1.2
-#
-# 刷完断电，然后按 README 第 7 节用 U 盘 / TFTP 引导 initramfs。
+# 刷完断电，然后按 README 第 7 节引导 initramfs。
 # 只写 mtd0（boot 分区），不碰其它分区。
 
-BASE="${1:-http://192.168.1.2:8000}"
+BASE1="${1:-tftp://192.168.1.2}"
+BASE2="${2:-http://192.168.1.2:8000}"
 
 SHA512_MX64=e642976560f5eea1ec52752305a8e54c082e028ee6d68276f6f2d4439e05db75002b68b6edea80ee23d52fd1e2802876d9e881352c5d7a1aa889b208472b1758
 SHA512_SMALL=34cc5396899ce445e9d296fbe9a31b1abf0aa4424036a1ed977eaeb23726c2bed69cd91028318c14bdb8b48ee4d5861bcd0ae78509762d3d410303215cb0f47d
 
 die() { echo "!! $*"; exit 1; }
 
-case "$BASE" in
-tftp://*) SCHEME=tftp ;;
-http://*) SCHEME=http ;;
-*) die "参数要以 http:// 或 tftp:// 开头: $BASE" ;;
-esac
+fetch_from() {	# $1 = base, $2 = 远端文件名, $3 = 本地路径；成功返回 0
+	case "$1" in
+	tftp://*)
+		host=${1#tftp://}
+		host=${host%%/*}
+		command -v tftp >/dev/null 2>&1 || return 3
+		rm -f "$3"
+		tftp -g -l "$3" -r "$2" "$host"
+		;;
+	http://*)
+		command -v wget >/dev/null 2>&1 || return 3
+		wget "$1/$2" -O "$3"
+		;;
+	*)	return 3 ;;
+	esac
+}
+
+fetch() {	# $1 = 远端文件名, $2 = 本地路径；按 BASE1 -> BASE2 顺序试
+	for b in "$BASE1" "$BASE2"; do
+		[ -n "$b" ] || continue
+		echo "   取 $1 自 $b"
+		if fetch_from "$b" "$1" "$2" && [ -s "$2" ]; then
+			return 0
+		fi
+		echo "   失败，换下一个来源"
+	done
+	die "取不到 $1（$BASE1 和 $BASE2 都失败）"
+}
 
 echo "==== 1/6 检测设备 ===="
 raw=""
@@ -59,24 +84,9 @@ NEED_UNLOCK=no
 [ "$ro" = "1" ] && NEED_UNLOCK=yes
 echo "   决定: TARGET=$TARGET NEED_UNLOCK=$NEED_UNLOCK"
 
-echo "==== 2/6 下载 $TARGET ($SCHEME) ===="
+echo "==== 2/6 下载 $TARGET ===="
 cd /tmp || die "进不去 /tmp"
 rm -f "$TARGET"
-
-fetch() {	# $1 = 远端文件名, $2 = 本地路径
-	case "$SCHEME" in
-	tftp)
-		host=${BASE#tftp://}
-		host=${host%%/*}
-		command -v tftp >/dev/null 2>&1 || die "这台设备的 busybox 没有 tftp，改用 http:// 方式"
-		tftp -g -l "$2" -r "$1" "$host" || die "tftp 取 $1 失败"
-		;;
-	http)
-		command -v wget >/dev/null 2>&1 || die "没有 wget，改用 tftp:// 方式"
-		wget "$BASE/$1" -O "$2" || die "wget 取 $1 失败"
-		;;
-	esac
-}
 
 fetch "$TARGET" "/tmp/$TARGET"
 

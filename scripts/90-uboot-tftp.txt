@@ -8,9 +8,9 @@ U-Boot 里用 TFTP 升级 bootloader / 引导 initramfs（不用按 reset、不�
 
 0) 上电后 3 秒内按任意键，停在 U-Boot 提示符（CONFIG_BOOTDELAY=3）
 
-   如果不按键，U-Boot 会按 UBI -> TFTP -> USB -> meraki 的顺序自动尝试。
-   默认 enable_tftp_boot=1、enable_usb_boot=0，所以 NAND 空/坏时会自己从
-   网络把镜像拉下来，不需要按 reset，也不需要插 U 盘。
+   如果不按键，U-Boot 会按 UBI -> USB -> TFTP -> meraki 的顺序自动尝试。
+   默认 enable_usb_boot=1、enable_tftp_boot=1：NAND 空/坏时先找 U 盘，
+   没有 U 盘就自己从网络拉镜像，都不需要按 reset。
 
 
 1) 看设备状态

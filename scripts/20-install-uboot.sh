@@ -1,13 +1,46 @@
 # 在 MX64 diagnostic mode 里执行：
 #   cd /tmp && wget http://192.168.1.2:8000/20-install-uboot.sh
-#   sh 20-install-uboot.sh http://192.168.1.2:8000
+#   sh 20-install-uboot.sh                                   # 默认 TFTP，失败回退 HTTP
+#   sh 20-install-uboot.sh tftp://192.168.1.2 http://192.168.1.2:8000
 # 先跑过 10-device-check.sh（结论在 /tmp/mx64-check.env）
 
-BASE="${1:-http://192.168.1.2}"
+BASE1="${1:-tftp://192.168.1.2}"
+BASE2="${2:-http://192.168.1.2:8000}"
 ENVFILE=/tmp/mx64-check.env
 
 SHA512_MX64=e642976560f5eea1ec52752305a8e54c082e028ee6d68276f6f2d4439e05db75002b68b6edea80ee23d52fd1e2802876d9e881352c5d7a1aa889b208472b1758
 SHA512_SMALL=34cc5396899ce445e9d296fbe9a31b1abf0aa4424036a1ed977eaeb23726c2bed69cd91028318c14bdb8b48ee4d5861bcd0ae78509762d3d410303215cb0f47d
+
+die() { echo "!! $*"; exit 1; }
+
+fetch_from() {	# $1 = base, $2 = 远端文件名, $3 = 本地路径
+	case "$1" in
+	tftp://*)
+		host=${1#tftp://}
+		host=${host%%/*}
+		command -v tftp >/dev/null 2>&1 || return 3
+		rm -f "$3"
+		tftp -g -l "$3" -r "$2" "$host"
+		;;
+	http://*)
+		command -v wget >/dev/null 2>&1 || return 3
+		wget "$1/$2" -O "$3"
+		;;
+	*)	return 3 ;;
+	esac
+}
+
+fetch() {	# $1 = 远端文件名, $2 = 本地路径
+	for b in "$BASE1" "$BASE2"; do
+		[ -n "$b" ] || continue
+		echo "   取 $1 自 $b"
+		if fetch_from "$b" "$1" "$2" && [ -s "$2" ]; then
+			return 0
+		fi
+		echo "   失败，换下一个来源"
+	done
+	die "取不到 $1（$BASE1 和 $BASE2 都失败）"
+}
 
 if [ ! -f "$ENVFILE" ]; then
 	echo "!! 先运行 10-device-check.sh"
@@ -26,7 +59,7 @@ cd /tmp || exit 1
 rm -f "$TARGET"
 
 echo "== 下载 =="
-wget "$BASE/$TARGET" -O "/tmp/$TARGET" || { echo "!! 下载失败"; exit 1; }
+fetch "$TARGET" "/tmp/$TARGET"
 
 size=$(wc -c < "/tmp/$TARGET")
 echo "   大小 $size (期望 $EXP_SIZE)"
@@ -51,8 +84,8 @@ fi
 
 if [ "$NEED_UNLOCK" = "yes" ]; then
 	echo "== 解锁 mtd0 =="
-	wget "$BASE/mtd-rw.ko" -O /tmp/mtd-rw.ko || { echo "!! 下载 mtd-rw.ko 失败"; exit 1; }
-	wget "$BASE/mtd" -O /tmp/mtd || { echo "!! 下载 mtd 失败"; exit 1; }
+	fetch mtd-rw.ko /tmp/mtd-rw.ko
+	fetch mtd /tmp/mtd
 	chmod +x /tmp/mtd
 	insmod /tmp/mtd-rw.ko i_want_a_brick=1 || echo "   (insmod 返回非 0，检查下面的 dmesg)"
 	dmesg | tail -5

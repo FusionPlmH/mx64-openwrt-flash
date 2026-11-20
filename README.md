@@ -11,7 +11,8 @@
 | 问题 | 答案 |
 |---|---|
 | 第一次装 U-Boot 要按 reset 吗？ | **要**。原厂固件只有 diagnostic mode 才给 shell，没有别的入口（这部分没法绕）。 |
-| 之后刷 initramfs 还要按 reset 吗？ | **不用**，只要用的是本仓库的 `uboot_ng.bin`。引导顺序是 UBI → TFTP → USB（USB 默认关闭），前一个失败自动试下一个，全程不碰按键。 |
+| 之后刷 initramfs 还要按 reset 吗？ | **不用**，只要用的是本仓库的 `uboot_ng.bin`。引导顺序是 UBI → USB → TFTP（USB 和 TFTP 都默认开），前一个失败自动试下一个，全程不碰按键。 |
+| 刷机脚本默认走什么传输？ | **TFTP**（`00-flash.ps1` 默认，PC 上要管理员权限起 UDP 69）。TFTP 不可用时设备端会自动回退到 HTTP。 |
 | 能不能一条命令刷完？ | 能。`scripts\00-flash.ps1` 在 PC 上起好服务并 telnet 注入 `one-shot-diag.sh`，设备端检测/校验/写入/回读全自动。 |
 
 ## 目录内容
@@ -62,39 +63,42 @@ scripts/
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -DryRun   # 先看它要做什么
-powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1           # 真跑
+powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1           # 真跑（默认 TFTP）
 ```
 
-`00-flash.ps1` 会自动：把 `files/` + `*.sh` 摊到一个临时目录 → 起 HTTP 服务 →
-连 `192.168.1.1:23` → 注入一行命令让设备跑 `one-shot-diag.sh` → 把设备输出实时打出来 →
-结束后关掉服务。
+`00-flash.ps1` 会自动：把 `files/` + `*.sh` 摊到一个临时目录 → 起 TFTP（同时起 HTTP 作备用）→
+连 `192.168.1.1:23` → 注入一行命令让设备跑 `one-shot-diag.sh <主传输> <备用传输>` →
+把设备输出实时打出来 → 结束后关掉服务。
 
 设备端的 `one-shot-diag.sh` 自己完成：判定 A0/B0+ 和 `mtd0` 大小 → 决定刷
 `uboot_mx64` 还是 `uboot_mx64_small` → （需要时）`insmod mtd-rw.ko` 解锁 →
-下载 → 长度 + SHA512 校验 → 写 `mtd0` → 回读前 64 KiB 比对。任何一步不符合预期就
-`!!` 报错停下，不会乱写。
+下载（**先 TFTP，取不到自动换 HTTP**）→ 长度 + SHA512 校验 → 写 `mtd0` →
+回读前 64 KiB 比对。任何一步不符合预期就 `!!` 报错停下，不会乱写。
 
-想用 TFTP 而不是 HTTP 传输（同一个脚本，换协议）：
+传输方式：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Transport tftp
-```
+| 命令 | 传输 | 权限 |
+|---|---|---|
+| `00-flash.ps1` | 默认 **TFTP**（主）+ HTTP（备用） | TFTP 要**管理员**（UDP 69） |
+| `00-flash.ps1 -Transport http` | HTTP（主）+ TFTP（备用） | 不需要管理员 |
 
-TFTP 需要 UDP 69，**必须以管理员身份运行**。也可以手动来：
+TFTP 起不来也不影响：脚本会提示一句，然后设备端自动回退到 HTTP。
+想只要服务、自己敲命令：
 
 ```powershell
 python scripts\70-tftp-server.py            # 服务 files/，UDP 69
+powershell -ExecutionPolicy Bypass -File scripts\01-serve-http.ps1   # 或只要 HTTP
 ```
 
-设备侧：
+设备侧手动跑一键脚本：
 
 ```sh
-sh one-shot-diag.sh tftp://192.168.1.2
+sh one-shot-diag.sh                                   # 默认 tftp://192.168.1.2，失败回退 http
+sh one-shot-diag.sh tftp://192.168.1.2 http://192.168.1.2:8000
 ```
 
-> 原厂 diagnostic mode 的 busybox 不一定带 `tftp` applet。脚本会先检查，没有就让你
-> 改用 HTTP。**真正的 TFTP 主场是刷完 U-Boot 之后**（见第 11 节），U-Boot 的
-> `tftpboot` 是原生支持的。
+> 原厂 diagnostic mode 的 busybox 不一定带 `tftp` applet。带就用 TFTP，不带会自动走 HTTP，
+> 两种都能刷。
 
 ---
 
@@ -188,18 +192,18 @@ cd /tmp && wget http://192.168.1.2:8000/20-install-uboot.sh && sh 20-install-ubo
 
 ## 7. 启动 initramfs / 过渡固件（默认走 TFTP，不用按 reset）
 
-刷完 `uboot_ng.bin` 之后的默认行为：`enable_tftp_boot=1`、`enable_usb_boot=0`，
+刷完 `uboot_ng.bin` 之后的默认行为：`enable_usb_boot=1`、`enable_tftp_boot=1`，
 引导顺序是
 
 ```
-UBI 里能起内核        -> 直接起 OpenWrt（不碰网络）
-UBI 起不来（空/坏）   -> 自动 tftp_boot（网络）
-TFTP 也没有           -> （USB 默认关）-> meraki 原厂分区（也关）
+UBI 里能起内核        -> 直接起 OpenWrt（不碰 U 盘/网络）
+UBI 起不来（空/坏）   -> 自动 usbload（U 盘，3 次尝试，2 条总线，2 个文件名）
+U 盘也不行            -> 自动 tftp_boot（网络）
 ```
 
-也就是说：**NAND 是空的就自己上网找镜像，不按 reset、不插 U 盘**。
+USB 和 TFTP 都默认开着，所以：**NAND 是空的就自己找 U 盘，找不到再上网，全程不按 reset**。
 
-### 7a. 走 TFTP（默认方式）
+### 7a. 走 TFTP
 
 PC 上（TFTP 需要管理员权限 / root）：
 
@@ -207,7 +211,7 @@ PC 上（TFTP 需要管理员权限 / root）：
 python scripts\70-tftp-server.py            # 服务 files/，UDP 69
 ```
 
-PC 网卡设成 `192.168.1.2/24`，网线接 LAN 口，然后**直接上电**。
+PC 网卡设成 `192.168.1.2/24`，网线接 LAN 口，然后**直接上电**（不插 U 盘就会走 TFTP）。
 
 `tftp_boot` 会按顺序试三个文件名，第一个能加载的就引导（`bootimg` 按镜像头判断类型）：
 
@@ -236,24 +240,18 @@ setenv tftp_file openwrt-bcm5862x-generic-meraki_mx64-initramfs-kernel.bin
 tftp_boot
 ```
 
-开关：
+开关（两个默认都是 1，按需关掉）：
 
 ```
+setenv enable_usb_boot 0      # 不想让它在 U 盘上浪费时间
 setenv enable_tftp_boot 0     # 不自动走网络
-setenv enable_usb_boot 1      # 把 U 盘路径打开（默认关）
-setenv disable_ubi_boot 1     # 跳过 UBI，直接走 TFTP/USB
+setenv disable_ubi_boot 1     # 跳过 UBI，直接走 USB/TFTP
 saveenv
 ```
 
-### 7b. 从 U 盘（需要先打开 USB）
+### 7b. 从 U 盘
 
-```
-setenv enable_usb_boot 1
-setenv enable_tftp_boot 0
-saveenv
-```
-
-然后在 U 盘根目录放 `openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin`
+默认就开着，U 盘根目录放 `openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin`
 （A0 用 `-a0-` 那个名字）。白灯闪 3 下 = 开始尝试 USB；灯常橙 = 引导中；
 之后绿闪（先快后慢）→ 绿色常亮 = 起来了。
 
@@ -345,8 +343,8 @@ reset
 ### LED 码
 
 琥珀=电源常亮；白灯 3 次连闪=开始 USB 尝试，1 闪=没检测到 U 盘，2 闪=有盘但没找到/加载不了文件，
-3 闪=文件加载了但没引导成功。**这些只在 `enable_usb_boot=1` 时才会出现**（默认是关的），
-默认走 TFTP 时灯只会常橙 → 绿闪 → 绿常亮。
+3 闪=文件加载了但没引导成功。**这些只在走 USB 路径时才会出现**；如果没插 U 盘直接走 TFTP，
+灯只会常橙 → 绿闪 → 绿常亮。
 
 ### 引导顺序（这就是"不用按 reset"的原因）
 
@@ -354,8 +352,8 @@ reset
 run soc_dtscheck; mx64init; run ubi_checkboot; run tftp_checkboot; run usb_checkboot; run meraki_checkboot
 ```
 
-UBI → **TFTP** → USB → meraki 依次尝试，前一个失败才走下一个。
-默认 `enable_tftp_boot=1`、`enable_usb_boot=0`，所以空 NAND 会自己走网络。
+UBI → USB → **TFTP** → meraki 依次尝试，前一个失败才走下一个。
+USB 和 TFTP 默认都开（`enable_usb_boot=1`、`enable_tftp_boot=1`），空 NAND 会先试 U 盘再上网。
 完整命令清单见 [scripts/90-uboot-tftp.txt](scripts/90-uboot-tftp.txt)。
 
 TFTP 恢复：

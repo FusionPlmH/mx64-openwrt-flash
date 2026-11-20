@@ -1,8 +1,10 @@
 ﻿# MX64 一键刷机（PC 侧编排）：起文件服务 + telnet 注入 one-shot-diag.sh。
 #
-#   powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1
-#   powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Transport tftp   # 需要管理员
-#   powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -DryRun           # 只看计划
+#   powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1              # 默认 TFTP（要管理员）
+#   powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Transport http   # 不用管理员
+#   powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -DryRun      # 只看计划
+#
+# 不管选哪种传输，HTTP 服务都会一起起来当备用：设备端先试 TFTP，取不到自动回退 HTTP。
 #
 # 前提：
 #   1) 设备已经在 diagnostic mode（按住 reset 上电，白灯闪两下后松手，等灯变绿）
@@ -16,8 +18,8 @@ param(
     [string]$ServerIp = '192.168.1.2',
     [string]$DeviceIp = '192.168.1.1',
     [int]$Port = 8000,
-    [ValidateSet('http', 'tftp')]
-    [string]$Transport = 'http',
+    [ValidateSet('tftp', 'http')]
+    [string]$Transport = 'tftp',
     [int]$TimeoutSec = 600,
     [switch]$DryRun
 )
@@ -47,13 +49,21 @@ if (-not $DryRun) {
     Copy-Item (Join-Path $PSScriptRoot '*.sh') $stage -Force
 }
 
-$base = if ($Transport -eq 'tftp') { "tftp://$ServerIp" } else { "http://${ServerIp}:$Port" }
-$bootstrap = "cd /tmp && wget http://${ServerIp}:$Port/one-shot-diag.sh && sh one-shot-diag.sh $base"
+$httpBase = "http://${ServerIp}:$Port"
+$tftpBase = "tftp://$ServerIp"
+# 设备端先试主传输，再回退到另一个
+if ($Transport -eq 'tftp') {
+    $primary = $tftpBase; $fallback = $httpBase
+} else {
+    $primary = $httpBase; $fallback = $tftpBase
+}
+$bootstrap = "cd /tmp && wget $httpBase/one-shot-diag.sh && sh one-shot-diag.sh $primary $fallback"
 
 Say ""
 Say "==== 计划 ====" 'Cyan'
 Say "  服务目录 : $stage"
-Say "  传输方式 : $Transport  ($base)"
+Say "  主传输   : $Transport  ($primary)"
+Say "  备用     : $fallback"
 Say "  设备     : $DeviceIp (telnet 23)"
 Say "  注入命令 : $bootstrap"
 Say ""
@@ -78,12 +88,12 @@ try {
         $servers += Start-Process python -ArgumentList (Join-Path $PSScriptRoot '70-tftp-server.py'), '--dir', $stage, '--port', '69' `
             -PassThru -WindowStyle Hidden -RedirectStandardOutput $tftpLog -RedirectStandardError "$tftpLog.err"
         $logs['tftp'] = $tftpLog
-        Say "TFTP 服务已启动 (pid $($servers[-1].Id), UDP 69；失败说明没管理员权限)"
+        Say "TFTP 服务已启动 (pid $($servers[-1].Id), UDP 69)"
         Start-Sleep -Seconds 1
         if ($servers[-1].HasExited) {
-            Say "TFTP 起不来，日志:" 'Red'
+            Say "TFTP 起不来（多数是没管理员权限），日志:" 'Yellow'
             Get-Content $tftpLog -ErrorAction SilentlyContinue | ForEach-Object { Say "  $_" }
-            throw "TFTP 启动失败（UDP 69 需要管理员权限）"
+            Say "继续用 HTTP 走（设备端会自动回退）" 'Yellow'
         }
     }
     Start-Sleep -Seconds 2
