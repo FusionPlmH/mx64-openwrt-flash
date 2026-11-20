@@ -332,6 +332,56 @@ reset
 | 换 U-Boot 后长时间橙白闪 | Shmoo 校准中；等几分钟，不行断电再上电；仍失败用 U 盘 initramfs 重装，**别再刷 U-Boot** |
 | 装完只有 ~370 MiB 可用 | 见第 8 节 |
 
+## mtd0 写不进去时，改 U-Boot 环境
+
+`mtd0` 在原厂 diag 里是 `ro=1`，进了 OpenWrt 之后又被 DTS 标成 `read-only`
+（`dd of=/dev/mtd0` 直接 `Operation not permitted`）。所以 **装好系统之后就再也写不动
+U-Boot 了**，除非接串口或重新进 diag。
+
+但 U-Boot 的行为大部分在环境变量里，而 `u-boot-env` 分区可写：
+
+```console
+# 0x400000..0x440000 之外，环境实际在 0x440000，正好一个 0x40000 擦除块 = mtd3
+dd if=/dev/mtd3 bs=4096 count=1 | tr -s '\000' '\n' | head    # 看当前环境
+```
+
+生成并写入（`config_dts` 就靠这个改，见下面"B0+ 的坑"）：
+
+```powershell
+python tools\mkenv.py files\uboot_ng.bin files\uboot-env.bin config_dts=config@4
+scp -O files\uboot-env.bin root@192.168.1.1:/tmp/
+```
+
+```sh
+# 设备上（u-boot-env 现在是空的话全 0xFF，不用先擦）
+dd if=/tmp/uboot-env.bin of=/dev/mtd3 bs=4096 conv=fsync
+sync
+dd if=/dev/mtd3 bs=4096 count=64 | md5sum    # 和本地比对
+reboot
+```
+
+工具会从二进制里提取编译内置的默认环境再追加覆盖项，CRC32 算好。**CRC 不对时
+U-Boot 只会退回默认环境，不会变砖**，所以这条路是安全的。
+
+### B0+ 的坑（OpenWrt 装完起不来的最常见原因）
+
+U-Boot 用 `bootm ${loadaddr}#${config_dts}` 启动，而装进 NAND 的 FIT 里
+**只有 `config@4`（B0+）或只有 `config@2`（A0）**，取决于你刷的 sysupgrade 镜像。
+`config_dts` 选错就是无限次掉回 USB/TFTP，永远进不了装好的系统。
+
+老版本 U-Boot 里这段是坏的：
+
+```c
+soc_dtscheck=...; getsocrev; if test $? = 1; then setenv config_dts config@4;
+                              else setenv config_dts config@2; fi
+```
+
+`$?` 在 U-Boot 的 hush 里拿不到命令返回值，所以永远走 `else` → 永远 A0。
+v3 起改成 `soc_dtscheck=if test -z "${config_dts}"; then getsocrev set; fi`，
+`getsocrev set` 自己 `setenv`，不再依赖 `$?`。
+
+即便不重刷 U-Boot，用上面的环境写入把 `config_dts=config@4` 写进去也能解决。
+
 ## 参考
 
 - OpenWrt wiki: <https://openwrt.org/toh/meraki/mx64>
