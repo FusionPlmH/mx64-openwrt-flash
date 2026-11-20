@@ -21,6 +21,8 @@ param(
     [ValidateSet('tftp', 'http')]
     [string]$Transport = 'tftp',
     [int]$TimeoutSec = 600,
+    [ValidateSet('clayface', 'ng')]
+    [string]$Uboot = 'clayface',
     [switch]$Check,
     [switch]$DryRun
 )
@@ -59,7 +61,8 @@ if ($Transport -eq 'tftp') {
     $primary = $httpBase; $fallback = $tftpBase
 }
 $checkArg = if ($Check) { '--check ' } else { '' }
-$bootstrap = "cd /tmp && wget $httpBase/one-shot-diag.sh && sh one-shot-diag.sh $checkArg$primary $fallback"
+$ngArg = if ($Uboot -eq 'ng') { '--ng ' } else { '' }
+$bootstrap = "cd /tmp && wget $httpBase/one-shot-diag.sh && sh one-shot-diag.sh $checkArg$ngArg$primary $fallback"
 
 Say ""
 Say "==== 计划 ====" 'Cyan'
@@ -67,6 +70,7 @@ Say "  服务目录 : $stage"
 Say "  主传输   : $Transport  ($primary)"
 Say "  备用     : $fallback"
 Say "  设备     : $DeviceIp (telnet 23)"
+Say "  U-Boot   : $(if ($Uboot -eq 'ng') { 'uboot_ng.bin（本项目，需 1 MiB 分区）' } else { 'clayface uboot_mx64 / uboot_mx64_small（按 mtd0 自动选）' })"
 Say "  模式     : $(if ($Check) { '--check（只看结论，不写 NAND）' } else { '真刷' })"
 Say "  注入命令 : $bootstrap"
 Say ""

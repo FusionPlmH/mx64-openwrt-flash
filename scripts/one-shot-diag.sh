@@ -13,19 +13,32 @@
 #   只看结论、什么都不写:
 #   sh one-shot-diag.sh --check
 #
+#   刷我们自己的 U-Boot（mx64-uboot-ng 编的，需要 1 MiB 分区）:
+#   sh one-shot-diag.sh --ng
+#
 # 刷完断电，然后按 README 第 7 节引导 initramfs。
 # 只写 mtd0（boot 分区），不碰其它分区。
 
 CHECK=0
-case "$1" in
---check|-n|--dry-run) CHECK=1; shift ;;
-esac
+USE_NG=0
+POS=""
+for a in "$@"; do
+	case "$a" in
+	--check|-n|--dry-run) CHECK=1 ;;
+	--ng|--uboot-ng)      USE_NG=1 ;;
+	*)                    POS="$POS $a" ;;
+	esac
+done
+# shellcheck disable=SC2086
+set -- $POS
 
 BASE1="${1:-tftp://192.168.1.2}"
 BASE2="${2:-http://192.168.1.2:8000}"
 
 SHA512_MX64=e642976560f5eea1ec52752305a8e54c082e028ee6d68276f6f2d4439e05db75002b68b6edea80ee23d52fd1e2802876d9e881352c5d7a1aa889b208472b1758
 SHA512_SMALL=34cc5396899ce445e9d296fbe9a31b1abf0aa4424036a1ed977eaeb23726c2bed69cd91028318c14bdb8b48ee4d5861bcd0ae78509762d3d410303215cb0f47d
+SHA512_NG=4a71afc6d8fdad14cc8a019656c35f33e90e7112d4a9b22cfa12f62b8ef0ca487bcaaf75b9db402c1490f893db167ef7103457ccb5f2154ae639f339316490f3
+NG_SIZE=598172
 
 die() { echo "!! $*"; exit 1; }
 
@@ -83,7 +96,12 @@ echo "   chip 0x18000000 = $rev -> ${VARIANT}"
 echo "   mtd0 size       = $mtd0size ($mtd0dec bytes)"
 echo "   mtd0 read-only  = ${ro:-unknown}"
 
-if [ "$mtd0dec" -ge 1048576 ]; then
+if [ "$USE_NG" = "1" ]; then
+	if [ "$mtd0dec" -lt 1048576 ]; then
+		die "uboot_ng.bin 有 $NG_SIZE 字节，装不进 $mtd0size 的 boot 分区。这台机器只能先用 uboot_mx64_small 走 README 第 6 节"
+	fi
+	TARGET=uboot_ng.bin; EXP_SHA512=$SHA512_NG; EXP_SIZE=$NG_SIZE
+elif [ "$mtd0dec" -ge 1048576 ]; then
 	TARGET=uboot_mx64; EXP_SHA512=$SHA512_MX64; EXP_SIZE=587312
 else
 	TARGET=uboot_mx64_small; EXP_SHA512=$SHA512_SMALL; EXP_SIZE=524288
@@ -109,6 +127,9 @@ if [ "$CHECK" = "1" ]; then
 	fi
 	if [ "$TARGET" = "uboot_mx64_small" ]; then
 		echo "  后续     : 512 KiB 分区 -> 还要走第 6 节（过渡固件换 1 MiB 布局）"
+	elif [ "$TARGET" = "uboot_ng.bin" ]; then
+		echo "  后续     : 断电后引导 openwrt-bcm53xx-...-initramfs.bin（第 7 节）；"
+		echo "             这是本项目编的 U-Boot，功能多但没在真机上验证过"
 	else
 		echo "  后续     : 断电后直接引导 openwrt-bcm53xx-...-initramfs.bin（第 7 节），不需要过渡固件"
 	fi
@@ -176,3 +197,4 @@ a0) echo "  initramfs 文件名: openwrt-bcm53xx-generic-meraki_mx64-a0-initramf
 *)  echo "  initramfs 文件名: openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin" ;;
 esac
 [ "$TARGET" = "uboot_mx64_small" ] && echo "  刷的是 small 版 -> 先走过渡固件（README 第 6 节）"
+[ "$TARGET" = "uboot_ng.bin" ] && echo "  刷的是本项目 U-Boot -> 之后可以用 flash_uboot 走 TFTP 升级（第 11 节）"

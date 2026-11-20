@@ -54,6 +54,23 @@ mx64info                      # 本项目的 U-Boot 才有这条命令
 判断口诀：**能 `df -h` 看到 `/overlay` 有几百 MB，就说明 OpenWrt 已经落到 NAND 上了**，
 那 `-initramfs-kernel.bin` 这一整套过渡流程你已经走完（或者根本不需要走）。
 
+## 脚本刷哪个 U-Boot？（默认 clayface 的）
+
+| 选项 | 刷什么 | 大小 | 什么时候用 |
+|---|---|---|---|
+| **默认** | `uboot_mx64` / `uboot_mx64_small`（clayface） | 587,312 / 524,288 B | **第一次刷机**。这是 wiki 上大量机器验证过的，失败率最低 |
+| `--ng` | `uboot_ng.bin`（本项目 `mx64-uboot-ng` 编） | 598,172 B，**只能 1 MiB 分区** | 已经能用 OpenWrt 之后想换成带 `bootimg`/`flash_uboot`/TFTP 自动引导的版本 |
+
+```sh
+sh one-shot-diag.sh --ng            # 设备上
+powershell ... scripts\00-flash.ps1 -Uboot ng    # PC 上
+```
+
+> **为什么默认不是 `uboot_ng`**：它到现在**还没有在真机上启动过**（编译、静态检查、镜像格式都验过，
+> 但没人按过电源）。第一次刷就用未验证的 bootloader，一旦起不来就只能上串口。
+> 更稳的顺序是：先刷 clayface 的 → 进 OpenWrt → 用 `flash_uboot`（TFTP + 回读 CRC 校验）
+> 换成 `uboot_ng.bin`，出问题还能用 TFTP/U 盘重来。
+
 ## 脚本已经替你做掉的判断
 
 `one-shot-diag.sh` 会自己按下表决定，**不需要你选任何东西**：
