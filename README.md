@@ -348,20 +348,41 @@ dd if=/dev/mtd3 bs=4096 count=1 | tr -s '\000' '\n' | head    # 看当前环境
 生成并写入（`config_dts` 就靠这个改，见下面"B0+ 的坑"）：
 
 ```powershell
-python tools\mkenv.py files\uboot_ng.bin files\uboot-env.bin config_dts=config@4
+python tools\mkenv.py files\uboot_ng.bin files\uboot-env.bin `
+    config_dts=config@4 ipaddr=192.168.1.10 serverip=192.168.1.2
 scp -O files\uboot-env.bin root@192.168.1.1:/tmp/
 ```
 
 ```sh
-# 设备上（u-boot-env 现在是空的话全 0xFF，不用先擦）
-dd if=/tmp/uboot-env.bin of=/dev/mtd3 bs=4096 conv=fsync
+# 设备上：NAND 必须先擦后写，已写过数据时直接 dd 会 Operation not permitted
+mtd erase u-boot-env
+dd if=/tmp/uboot-env.bin of=/dev/mtd3 bs=4096
 sync
 dd if=/dev/mtd3 bs=4096 count=64 | md5sum    # 和本地比对
 reboot
 ```
 
-工具会从二进制里提取编译内置的默认环境再追加覆盖项，CRC32 算好。**CRC 不对时
-U-Boot 只会退回默认环境，不会变砖**，所以这条路是安全的。
+`files/uboot-env.bin` 就是这份（crc `0x7b2ae92f`，md5 `7e35ca65061087b233b093161e94ce05`），
+可以直接用。注意 `mtd` 工具只认 **label**（`u-boot-env`），传 `mtd3` 会报
+`Could not open mtd device`。
+
+### 需要刷 mtd0 时：让 U-Boot 自己刷自己
+
+进了 OpenWrt 之后 mtd0 写不动，diag 模式又随原厂 bootloader 一起没了。但 U-Boot
+自带 `flash_uboot`，把它临时塞进 `bootcmd` 就行：
+
+```powershell
+python tools\mkenv.py files\uboot_ng.bin files\uboot-env-flash.bin `
+    config_dts=config@4 ipaddr=192.168.1.10 serverip=192.168.1.2 `
+    "bootcmd=run soc_dtscheck; mx64init; flash_uboot uboot_ng.bin 100000 confirm; run ubi_checkboot; run usb_checkboot; run tftp_checkboot; run meraki_checkboot"
+```
+
+写进 mtd3，让 TFTP 服务端（`01-serve-http.ps1` 旁边那个 `70-tftp-server.py`）跑着，
+断电重启。U-Boot 会 TFTP 拉镜像、校验大小和首字（必须是 ARM 分支指令）、擦写 mtd0、
+回读 CRC，然后继续正常启动。**任何一步不满足就打印 `TFTP failed, nothing was written`
+直接跳过，不会留下半写的 mtd0。**
+
+刷完记得把 `bootcmd` 换回默认（去掉 `flash_uboot`），否则每次开机都会重刷一遍。
 
 ### B0+ 的坑（OpenWrt 装完起不来的最常见原因）
 
@@ -378,9 +399,13 @@ soc_dtscheck=...; getsocrev; if test $? = 1; then setenv config_dts config@4;
 
 `$?` 在 U-Boot 的 hush 里拿不到命令返回值，所以永远走 `else` → 永远 A0。
 v3 起改成 `soc_dtscheck=if test -z "${config_dts}"; then getsocrev set; fi`，
-`getsocrev set` 自己 `setenv`，不再依赖 `$?`。
+由 `getsocrev set` 自己 `setenv`。
 
-即便不重刷 U-Boot，用上面的环境写入把 `config_dts=config@4` 写进去也能解决。
+> **实测提醒**：在这一台（`0x3F05CF1E`，rev 5，B0+）上，即使换了 v3 的
+> `getsocrev set`，空环境时它仍然选了 `config@2`。所以**不要指望自动探测**，
+> 直接把 `config_dts=config@4` 写进环境（就是 `files/uboot-env.bin` 干的事）。
+> 真正的根因（`__raw_readl(0x18000000)` 在 U-Boot 里读到的值，还是 `setenv` 在
+> `run` 链里不生效）要接串口看 `mx64info` 才能定位。
 
 ## 参考
 
