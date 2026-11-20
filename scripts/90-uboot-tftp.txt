@@ -40,8 +40,13 @@ U-Boot 里用 TFTP 升级 bootloader / 引导 initramfs（不用按 reset、不�
 
    它会按顺序试三个文件名，第一个能加载的就引导：
      1. ${tftp_file}                     (你手动设的，可选)
-     2. openwrt-bcm53xx-generic-meraki_mx64[-a0]-initramfs.bin
-     3. openwrt-bcm5862x-generic-meraki_mx64[a0]-initramfs-kernel.bin  (SPIM 过渡固件)
+     2. openwrt-bcm53xx-generic-meraki_mx64[-a0]-initramfs.bin         <- 正常路径用这个
+     3. openwrt-bcm5862x-generic-meraki_mx64[a0]-initramfs-kernel.bin  <- 只有 512 KiB 机器才用
+
+   两个文件是不同容器，不是同一东西的两个版本:
+     FIT  (d0 0d fe ed) = OpenWrt RAM 系统，bootm 引导，装完 sysupgrade 就好了
+     SPIM (53 50 49 4d) = Meraki loader 格式的过渡固件，bootbk 引导，
+                          里面带 1 MiB 版 uboot_mx64，只为把 512 KiB 分区换成 1 MiB
 
    A0/B0+ 的名字由 config_dts 自动选。每个文件都交给 bootimg 判断类型:
      d0 0d fe ed (FIT)  -> bootm <addr>#<config@N>
@@ -49,8 +54,8 @@ U-Boot 里用 TFTP 升级 bootloader / 引导 initramfs（不用按 reset、不�
 
    TFTP 根目录直接放 kit 的 files/ 内容即可，不用改名。
 
-   想只刷一个固定文件:
-     setenv tftp_file openwrt-bcm5862x-generic-meraki_mx64-initramfs-kernel.bin
+   想只刷一个固定文件（正常路径就写 FIT 那个名字）:
+     setenv tftp_file openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin
      tftp_boot
 
    想手动指定地址:

@@ -6,7 +6,55 @@
 本仓库: <https://github.com/FusionPlmH/mx64-openwrt-flash>
 配套 U-Boot 源码: <https://github.com/FusionPlmH/mx64-uboot-refresh>
 
-## 先回答三个常见问题
+## 我该用哪个镜像？（先看这张表）
+
+关键只有一件事：**你的 `mtd0` 有多大**（`cat /proc/mtd`，diagnostic mode 或 OpenWrt 里都能看）。
+
+| 你的 mtd0 | 刷的 U-Boot | 引导进 OpenWrt 用的文件 | 需要 `-initramfs-kernel.bin` 吗 |
+|---|---|---|---|
+| `00100000`（1 MiB）**大多数机器** | `uboot_mx64` 或 `uboot_ng.bin` | `openwrt-bcm53xx-generic-meraki_mx64[-a0]-initramfs.bin`（FIT，`bootm`） | **不需要** |
+| `00080000`（512 KiB） | `uboot_mx64_small` | `openwrt-bcm5862x-generic-meraki_mx64[a0]-initramfs-kernel.bin`（SPIM，`bootbk`） | **需要**，只用来把 boot 分区换成 1 MiB 布局 |
+
+这两类文件是完全不同的容器格式，不是同一个东西的两种版本：
+
+| 文件 | 容器 | 谁引导它 | 干什么用 |
+|---|---|---|---|
+| `openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin` | **FIT**（首字节 `d0 0d fe ed`） | U-Boot `bootm` | 正常的 OpenWrt RAM 系统，装完 sysupgrade 就完整了 |
+| `openwrt-bcm5862x-generic-meraki_mx64-initramfs-kernel.bin` | **SPIM**（首字节 `53 50 49 4d`） | Meraki loader / U-Boot `bootbk` | 只有 512 KiB 的老机器需要：里面带着 1 MiB 版 `uboot_mx64`，用来 `mtd write` 换布局 |
+
+所以：**刷过 U-Boot（`uboot_mx64`）之后，只需要 `openwrt-bcm53xx-...-initramfs.bin` + sysupgrade**，
+`-initramfs-kernel.bin` 那个只跟"512 KiB → 1 MiB"的升级有关，正常路径用不到（放着也没关系，
+两个文件同时存在时代码会先试 FIT，不会选错）。
+
+## 不确定自己刷到哪一步了？几条命令看清楚
+
+诊断模式或 OpenWrt 的 shell 里：
+
+```sh
+cat /proc/mtd                 # mtd0 多大 -> 决定 uboot_mx64 还是 uboot_mx64_small
+cat /sys/block/mtdblock0/ro   # 1 = 写保护没解，0 = 可写
+```
+
+已经能 SSH 进 OpenWrt 的话：
+
+```sh
+cat /proc/cmdline             # root= 后面是 /dev/ubiblock0_0 => 装进 NAND 了
+                              # root=/dev/ram0 或 ramdisk    => 还在 RAM 里（initramfs）
+df -h /overlay                # 有 /overlay 且大小 ~数百 MB => sysupgrade 过
+ubinfo -a                     # 有 rootfs_data 卷 = 已经装好；只剩 part.*/storage => 还没装
+```
+
+在 U-Boot 提示符里：
+
+```sh
+version                       # clayface 版不带 tag；本项目的带 "mx64-ng-2012.10-v2"
+mx64info                      # 本项目的 U-Boot 才有这条命令
+```
+
+判断口诀：**能 `df -h` 看到 `/overlay` 有几百 MB，就说明 OpenWrt 已经落到 NAND 上了**，
+那 `-initramfs-kernel.bin` 这一整套过渡流程你已经走完（或者根本不需要走）。
+
+## 先回答几个常见问题
 
 | 问题 | 答案 |
 |---|---|
@@ -23,15 +71,15 @@ SHA256SUMS                   所有文件的校验值
 files/                       设备要用的文件（拷到 U 盘根目录 / HTTP 服务器根目录）
   uboot_mx64                 1 MiB boot 分区用的 U-Boot（clayface，U-Boot 2012.10）
   uboot_mx64_small           512 KiB boot 分区用的 U-Boot（同上，裁剪版）
-  uboot_ng.bin               本项目的 U-Boot（含 bootimg/flash_uboot/TFTP，597,636 B）
+  uboot_ng.bin               本项目的 U-Boot（含 bootimg/flash_uboot/TFTP，598,172 B）
   mtd                        busybox mtd 工具（解锁写保护后写分区用）
   mtd-rw.ko                  mtd0 写保护解锁模块（仅 mtd0 只读时需要）
-  openwrt-bcm5862x-generic-meraki_mx64-initramfs-kernel.bin    过渡固件 B0+
-  openwrt-bcm5862x-generic-meraki_mx64a0-initramfs-kernel.bin  过渡固件 A0
-  openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin            OpenWrt initramfs B0+
-  openwrt-bcm53xx-generic-meraki_mx64-a0-initramfs.bin         OpenWrt initramfs A0
-  openwrt-25.12.6-bcm53xx-generic-meraki_mx64-squashfs.sysupgrade.bin     B0+
-  openwrt-25.12.6-bcm53xx-generic-meraki_mx64-a0-squashfs.sysupgrade.bin  A0
+  openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin            OpenWrt RAM 系统 B0+（FIT）
+  openwrt-bcm53xx-generic-meraki_mx64-a0-initramfs.bin         OpenWrt RAM 系统 A0（FIT）
+  openwrt-25.12.6-bcm53xx-generic-meraki_mx64-squashfs.sysupgrade.bin    装到 NAND 用 B0+
+  openwrt-25.12.6-bcm53xx-generic-meraki_mx64-a0-squashfs.sysupgrade.bin 装到 NAND 用 A0
+  openwrt-bcm5862x-generic-meraki_mx64-initramfs-kernel.bin    ★ 只有 512 KiB 机器才用（SPIM 过渡固件）B0+
+  openwrt-bcm5862x-generic-meraki_mx64a0-initramfs-kernel.bin  ★ 只有 512 KiB 机器才用（SPIM 过渡固件）A0
 scripts/
   00-flash.ps1               PC 侧一键：起服务 + telnet 注入 + 全程自动（-DryRun 只看计划）
   01-serve-http.ps1          PC 侧：起 HTTP 服务器（只想起服务、手动敲命令时用）
@@ -163,23 +211,28 @@ mtd0 ro      : 0                   -> 不需要解锁
 ## 5. 刷 U-Boot
 
 ```sh
-cd /tmp && wget http://192.168.1.2:8000/20-install-uboot.sh && sh 20-install-uboot.sh http://192.168.1.2:8000
+cd /tmp && wget http://192.168.1.2:8000/20-install-uboot.sh && sh 20-install-uboot.sh
 ```
 
+默认先走 TFTP（`tftp://192.168.1.2`），取不到自动回退 `http://192.168.1.2:8000`。
 脚本做的事：
-1. 从 HTTP 服务器 `wget` 对应镜像到 `/tmp`；
+
+1. 取对应镜像到 `/tmp`；
 2. 用**内嵌的 SHA512 期望值**校验（设备上没 `sha512sum` 时退化为长度校验并警告）；
-3. 只读时先 `insmod mtd-rw.ko i_want_a_brick=1`，再从 `dmesg` 确认
-   `_mtd-rw: mtd0: setting writeable flag_`；
+3. 只读时先 `insmod mtd-rw.ko i_want_a_brick=1`，再回读 `/sys/block/mtdblock0/ro` 确认真的解锁；
 4. 只读 → `mtd write <img> /dev/mtd0`；可写 → `dd if=<img> of=/dev/mtdblock0`；
 5. 回读前 64 KiB 做一次比对，然后 `sync`。
 
-完成后**断电**。
+刷的是 `uboot_mx64`（mtd0 = 1 MiB）就**已经完事**了，断电，直接跳到第 7 节引导
+`openwrt-bcm53xx-...-initramfs.bin` → 第 9 节 sysupgrade。**不需要** `-initramfs-kernel.bin`。
 
 ## 6. 如果只能刷 `uboot_mx64_small`（mtd0 = 0x80000）
 
+**只有这一节需要 `-initramfs-kernel.bin`**，它是"过渡固件"：一个 SPIM 容器的 Linux，
+里面自带 1 MiB 版 `uboot_mx64`，专门用来把 512 KiB 的 boot 分区升级成 1 MiB 布局。
+
 1. 把 `openwrt-bcm5862x-generic-meraki_mx64-initramfs-kernel.bin`（A0 用 `..._mx64a0-...`）
-   放在 U 盘根目录，插上设备；
+   放在 U 盘根目录（或 TFTP 根目录），插上设备；
 2. 按住 reset 上电 → 白/橙交替快闪 → 松手，设备从 U 盘引导进过渡固件（OpenWrt）。
    （**这一步要按 reset**：`uboot_mx64_small` 是 clayface 的版本，它的引导逻辑是按键触发的；
    换成 `uboot_ng.bin` 之后就不用再按了，见第 7 节。）
@@ -189,11 +242,14 @@ cd /tmp && wget http://192.168.1.2:8000/20-install-uboot.sh && sh 20-install-ubo
 5. **不要重启**，直接做第 9 节 sysupgrade。
 6. 换完 U-Boot 后第一次启动要重做 Shmoo 校准，会**很久**（几分钟）。橙白闪说明 UBI 引导失败：
    这时用 U 盘引导 initramfs 重装 OpenWrt，**不要再刷 U-Boot**。
+7. 换完之后这个过渡固件就再也用不到了，可以删掉。
 
-## 7. 启动 initramfs / 过渡固件（默认走 TFTP，不用按 reset）
+## 7. 启动 OpenWrt（正常路径，默认走 TFTP，不用按 reset）
 
-刷完 `uboot_ng.bin` 之后的默认行为：`enable_usb_boot=1`、`enable_tftp_boot=1`，
-引导顺序是
+刷完 `uboot_mx64` / `uboot_ng.bin`（mtd0 = 1 MiB）之后，引导的是
+`openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin`（FIT），**跟 `-initramfs-kernel.bin` 无关**。
+
+默认行为：`enable_usb_boot=1`、`enable_tftp_boot=1`，引导顺序是
 
 ```
 UBI 里能起内核        -> 直接起 OpenWrt（不碰 U 盘/网络）
@@ -218,8 +274,8 @@ PC 网卡设成 `192.168.1.2/24`，网线接 LAN 口，然后**直接上电**（
 | 顺序 | 文件名 | 类型 |
 |---|---|---|
 | 1 | `${tftp_file}`（你自己设的，可选） | 任意 |
-| 2 | `openwrt-bcm53xx-generic-meraki_mx64[-a0]-initramfs.bin` | FIT → `bootm` |
-| 3 | `openwrt-bcm5862x-generic-meraki_mx64[a0]-initramfs-kernel.bin` | SPIM 过渡固件 → `bootbk` |
+| 2 | `openwrt-bcm53xx-generic-meraki_mx64[-a0]-initramfs.bin` | FIT → `bootm`（**正常路径用的就是它**） |
+| 3 | `openwrt-bcm5862x-generic-meraki_mx64[a0]-initramfs-kernel.bin` | SPIM 过渡固件 → `bootbk`（只有 512 KiB 机器才需要） |
 
 所以 `files/` 里的东西**原样放在 TFTP 根目录**就行，不需要改名。
 A0/B0+ 由 `config_dts` 自动决定用哪套文件名。
