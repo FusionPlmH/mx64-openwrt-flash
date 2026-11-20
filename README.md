@@ -7,6 +7,9 @@
 - 本仓库: <https://github.com/FusionPlmH/mx64-openwrt-flash>
 - 配套 U-Boot 源码: <https://github.com/FusionPlmH/mx64-uboot-refresh>
 
+> 下文默认 PC 地址 `192.168.1.2`、设备地址 `192.168.1.1`。
+> 实际地址不同就换成自己的；脚本的网络参数见「一键刷机」一节。
+
 ## 我该用哪个镜像？
 
 关键只有一件：**你的 `mtd0` 有多大**（`cat /proc/mtd`，脚本会自动读）。
@@ -102,16 +105,43 @@ backup/                      -Check 时自动存的原厂 mtd0 头部（.gitigno
 前置只有两条：
 
 1. 设备已进 diagnostic mode（按住 reset 上电，白灯闪两下后松手，等灯变绿）
-2. PC 网卡 `192.168.1.2/24`，网线接设备 LAN 口
+2. PC 网卡与设备同网段（默认 `192.168.1.2/24`），网线接设备 LAN 口
 
 ```powershell
-cd "C:\Users\Peter\Desktop\cisco mx64\mx64-openwrt-flash-kit"
+cd mx64-openwrt-flash      # git clone 默认目录名；也可以 cd 到你放 kit 的目录
 
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -DryRun     # 看计划
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Check      # 只读设备、出结论
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Probe      # 只验证 mtd 工具，不擦不写
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1             # 真刷（默认 HTTP 下载 + U 盘冷启动）
 ```
+
+网络参数都可以改；`-ServerIp` 不写时会自动选本机 `192.168.1.x` 地址（优先 `192.168.1.2`）：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-ServerIp` | 自动探测 | PC 侧地址，必须和 `-DeviceIp` 同网段 |
+| `-DeviceIp` | `192.168.1.1` | diagnostic mode / OpenWrt 的设备地址 |
+| `-StockLanIp` | `192.168.0.1` | 原厂固件的 LAN 地址，仅用于连不上时的提示探测 |
+| `-PrefixLength` | `24` | 提示 `New-NetIPAddress` 时用的掩码长度 |
+| `-Port` | `8000` | 临时 HTTP 服务端口 |
+
+例如网卡已经是 `192.168.1.50`：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -ServerIp 192.168.1.50
+```
+
+### 换一台电脑 / 换一台 MX64
+
+- **换 PC**：Windows 10/11，PowerShell 5.1+，Python 3.7+，OpenSSH 客户端（`ssh`/`scp`）。
+  脚本用相对路径、自动探测 `192.168.1.x`、临时目录跟随 `%TEMP%`，不需要改代码；
+  网卡上没有同网段地址时，先按脚本提示用 `New-NetIPAddress` 加一个。
+- **换 MX64/MX64W**：`00-flash.ps1` 会自动读 `mtd0` 大小和 SoC 版本，决定刷哪个 U-Boot 和镜像；
+  `files/` 里的镜像由 `SHA256SUMS` 逐个校验。需要指定别的 sysupgrade 版本时用 `-SysupgradeFile`。
+- **必须按自己的环境改的**：`02-copy-to-usb.ps1 -Drive E:\` 的盘符；
+  `90-uboot-tftp.txt` 里的 `ethaddr`（换成新机器标签上的 MAC）和 `serverip`（PC 地址）。
+- **不要一起分发**：`backup/`、`mx64-backup/`（本机的设备备份），已在 `.gitignore` 里忽略。
 
 第 2 阶段**只起一种服务**：diag 模式下设备要靠 `wget` 把镜像拉进去，所以 HTTP 一定起；
 TFTP 只在 `-BootMedia tftp` 时起（那种模式下 U-Boot 会自己来取 initramfs）。
@@ -125,7 +155,7 @@ TFTP 只在 `-BootMedia tftp` 时起（那种模式下 U-Boot 会自己来取 in
 
 | 检查 | 为什么 |
 |---|---|
-| 本机有 `192.168.1.2` 这个地址 | 没地址设备连不上，脚本会给出 `New-NetIPAddress` 的命令 |
+| 本机有与设备同网段的地址 | `-ServerIp` 不指定时自动选 `192.168.1.x`；一个都没有就给出 `New-NetIPAddress` 的命令 |
 | python >= 3.7 | `http.server --directory` 需要 3.7 |
 | ssh / scp 存在 | 第 6 阶段要用；没有就自动跳过 sysupgrade |
 | 是否管理员 | Windows 绑 UDP 69 **不需要**管理员，只是提示 |
@@ -133,7 +163,7 @@ TFTP 只在 `-BootMedia tftp` 时起（那种模式下 U-Boot 会自己来取 in
 | **端口是否被占用** | 只查本轮真用到的：`TCP 8000`（HTTP）；`-BootMedia tftp` 时再加 `UDP 69`。上一轮没退干净的 python 服务会让第 2 阶段直接失败 |
 | **`files/` 里所有镜像的完整性** | 优先按 `SHA256SUMS` 逐个比对（覆盖 12 个文件）；没有 `SHA256SUMS` 才退回 `*.sha256` / `*.sha512` sidecar。防止刷进旧版本或下坏的镜像 |
 | **U-Boot 版本 tag** | 从 `uboot_ng.bin` 里抓 `mx64-ng-*`，一眼确认刷的是哪个构建 |
-| C 盘剩余空间 | 暂存要 ~35 MB |
+| `%TEMP%` 所在盘剩余空间 | 暂存要 ~35 MB |
 
 第 3 阶段连不上 telnet 时也会自动探测：
 
@@ -197,6 +227,8 @@ dd if=/dev/mtd0 bs=65536 skip=0 count=1 2>/dev/null   # 整镜像回读：skip=0
 | `-BootTimeoutSec <秒>` | 第 4 阶段等 22 端口多久，默认 **900** |
 | `-Transport http` | diag 下载方式，默认就是 http（`tftp` 无效：设备没有 tftp 客户端） |
 | `-SysupgradeFile <路径>` | 指定 sysupgrade 镜像（默认按 A0/B0+ 自动挑最新的） |
+| `-ServerIp <地址>` | PC 侧地址（默认自动探测本机 `192.168.1.x`） |
+| `-DeviceIp <地址>` | 设备地址（默认 `192.168.1.1`） |
 
 ### 输出长这样
 
@@ -295,11 +327,12 @@ E:\
 
 ### 2. PC 侧服务
 
-一般由 `00-flash.ps1` 自动起。想单独起：
+一般由 `00-flash.ps1` 自动起。想单独起（下面的手动命令按 PC=`192.168.1.2`、设备=`192.168.1.1` 写，换过地址就替换成自己的）：
 
 ```powershell
 python scripts\70-tftp-server.py                                   # TFTP，UDP 69（Windows 不需要管理员）
-powershell -ExecutionPolicy Bypass -File scripts\01-serve-http.ps1 # HTTP，:8000
+powershell -ExecutionPolicy Bypass -File scripts\01-serve-http.ps1 # HTTP，:8000（自动选本机 192.168.1.x）
+powershell -ExecutionPolicy Bypass -File scripts\01-serve-http.ps1 -ServerIp 192.168.1.50 -Port 8000
 ```
 
 ### 3. 进入 diagnostic mode

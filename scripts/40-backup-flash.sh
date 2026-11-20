@@ -1,6 +1,6 @@
 #!/bin/sh
 # 在 OpenWrt 里执行（initramfs 或已装好的系统均可），备份原厂分区到 /tmp/backup。
-#   cd /tmp && wget http://192.168.1.2/40-backup-flash.sh && sh 40-backup-flash.sh
+#   cd /tmp && wget http://<PC_IP>/40-backup-flash.sh && sh 40-backup-flash.sh
 # 然后用 PC 侧 scripts/03-fetch-backup.ps1 拉回来。
 
 OUT=/tmp/backup

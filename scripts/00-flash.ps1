@@ -21,12 +21,15 @@
 #    而拔电源冷启动 + 插 U 盘一次就成功（约 77 秒起 initramfs）。
 #    所以脚本不再负责重启，只负责在正确时刻让你拔电。
 #
-#  前提：设备已在 diagnostic mode；PC 网卡 192.168.1.2/24。
+#  前提：设备已在 diagnostic mode；PC 网卡与设备同网段。
+#        -ServerIp 不指定时自动选本机 192.168.1.x 地址，没有才回退到 192.168.1.2。
 # =============================================================================
 
 param(
-    [string]$ServerIp = '192.168.1.2',
+    [string]$ServerIp = '',
     [string]$DeviceIp = '192.168.1.1',
+    [string]$StockLanIp = '192.168.0.1',
+    [int]$PrefixLength = 24,
     [int]$Port = 8000,
     [ValidateSet('http', 'tftp')]
     [string]$Transport = 'http',
@@ -47,6 +50,23 @@ param(
 $ErrorActionPreference = 'Stop'
 $kitRoot = Split-Path -Parent $PSScriptRoot
 $filesDir = Join-Path $kitRoot 'files'
+
+# 没显式给 -ServerIp 时，优先用本机已有的 192.168.1.x 地址（没有就按惯例回退到 .2）。
+if (-not $ServerIp) {
+    $autoIp = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -match '^192\.168\.1\.' -and $_.IPAddress -ne $DeviceIp } |
+        Sort-Object { if ($_.IPAddress -eq '192.168.1.2') { 0 } else { 1 } } |
+        Select-Object -First 1
+    $ServerIp = if ($autoIp) { $autoIp.IPAddress } else { '192.168.1.2' }
+}
+$parsedIp = $null
+if (-not [System.Net.IPAddress]::TryParse($ServerIp, [ref]$parsedIp)) {
+    throw "-ServerIp 不是合法 IPv4 地址: $ServerIp"
+}
+$parsedDevIp = $null
+if (-not [System.Net.IPAddress]::TryParse($DeviceIp, [ref]$parsedDevIp)) {
+    throw "-DeviceIp 不是合法 IPv4 地址: $DeviceIp"
+}
 
 # ----------------------------------------------------------------- UI
 $script:T0 = Get-Date
@@ -188,7 +208,7 @@ if (-not $hasIp) {
     Bad "本机没有 $ServerIp 这个地址"
     Note '先执行（管理员 PowerShell）：'
     Note '  Get-NetAdapter | Format-Table Name,InterfaceIndex,Status'
-    Note "  New-NetIPAddress -InterfaceIndex <索引> -IPAddress $ServerIp -PrefixLength 24"
+    Note "  New-NetIPAddress -InterfaceIndex <索引> -IPAddress $ServerIp -PrefixLength $PrefixLength"
     throw "缺少地址 $ServerIp"
 }
 Ok "网卡地址 $ServerIp 就绪"
@@ -315,12 +335,18 @@ if (Test-Path $ngPath) {
     if (-not $tagM.Success) { Warn 'uboot_ng.bin 里没有 mx64-ng tag，这镜像可能不是本项目构建的' }
 }
 
-# ---- 磁盘空间（暂存要 ~35 MB）----
-$freeMB = [math]::Round((Get-PSDrive C).Free / 1MB)
-if ($freeMB -lt 200) { Warn "C 盘只剩 $freeMB MB，暂存镜像可能失败" }
-else { Ok "C 盘剩余 $freeMB MB" }
+# ---- 磁盘空间（暂存要 ~35 MB；跟随 %TEMP% 所在盘，不假定 C:）----
+$tempDrive = (Split-Path -Qualifier $env:TEMP)
+$freeMB = $null
+if ($tempDrive -match '^[A-Za-z]:$') {
+    $pd = Get-PSDrive -Name ($tempDrive.TrimEnd(':')) -ErrorAction SilentlyContinue
+    if ($pd -and $pd.Free) { $freeMB = [math]::Round($pd.Free / 1MB) }
+}
+if ($null -eq $freeMB) { Note "无法读取 $env:TEMP 所在盘的剩余空间，跳过检查" }
+elseif ($freeMB -lt 200) { Warn "$tempDrive 盘只剩 $freeMB MB，暂存镜像可能失败" }
+else { Ok "$tempDrive 盘剩余 $freeMB MB" }
 
-$stage = Join-Path $env:TEMP 'mx64-http'
+$stage = Join-Path $env:TEMP "mx64-http-$Port"
 if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
 New-Item -ItemType Directory $stage | Out-Null
 Copy-Item (Join-Path $filesDir '*') $stage -Force
@@ -332,8 +358,10 @@ Phase 2 '启动传输服务'
 $servers = @()
 $logs = @{}
 $keepServers = $false
-$httpLog = Join-Path $env:TEMP 'mx64-http.log'
-$servers += Start-Process python -ArgumentList '-m', 'http.server', "$Port", '--bind', '0.0.0.0', '--directory', $stage `
+$httpLog = Join-Path $env:TEMP "mx64-http-$Port.log"
+# $stage 可能在带空格的用户名目录下（C:\Users\John Doe\...），Start-Process 不自动加引号
+$httpArgs = @('-m', 'http.server', "$Port", '--bind', '0.0.0.0', '--directory', "`"$stage`"")
+$servers += Start-Process python -ArgumentList $httpArgs `
     -PassThru -WindowStyle Hidden -RedirectStandardOutput $httpLog -RedirectStandardError "$httpLog.err"
 $logs['http'] = $httpLog
 Ok "HTTP  $httpBase  (pid $($servers[-1].Id))"
@@ -347,7 +375,7 @@ function Stop-Servers {
 # TFTP 只在 -BootMedia tftp 时起：那种模式下 U-Boot 会自己来取 initramfs。
 # 默认（U 盘冷启动）根本不需要 TFTP，起了只是白占 UDP 69、还得处理权限。
 $tftpOk = $false
-$tftpLog = Join-Path $env:TEMP 'mx64-tftp.log'
+$tftpLog = Join-Path $env:TEMP "mx64-tftp-$Port.log"
 if ($needTftp) {
     # 注意：$PSScriptRoot 里可能有空格（cisco mx64），Start-Process 的 -ArgumentList 不自动加引号
     $tftpPy = '"{0}"' -f (Join-Path $PSScriptRoot '70-tftp-server.py')
@@ -379,8 +407,8 @@ try {
         $probes = @(
             @{ ip = $DeviceIp;     port = 80; hint = '80 开着（LuCI/OpenWrt，或原厂固件的管理页面 —— 都不是 diagnostic mode）' },
             @{ ip = $DeviceIp;     port = 22; hint = '设备已经在跑 OpenWrt（不是 diagnostic mode）' },
-            @{ ip = '192.168.0.1'; port = 23; hint = '原厂固件 LAN 默认地址是 192.168.0.1' },
-            @{ ip = '192.168.0.1'; port = 80; hint = '原厂固件 LAN 默认地址是 192.168.0.1' }
+            @{ ip = $StockLanIp; port = 23; hint = "原厂固件 LAN 默认地址是 $StockLanIp" },
+            @{ ip = $StockLanIp; port = 80; hint = "原厂固件 LAN 默认地址是 $StockLanIp" }
         )
         $found = $false
         $looksInstalled = $false
@@ -394,7 +422,7 @@ try {
         if ($looksInstalled) {
             Write-Host ''
             Ok "$DeviceIp`:22 开着，说明 OpenWrt 已经装好了 —— 这个脚本没事可做"
-            Note '如果只是想确认系统状态：ssh root@192.168.1.1'
+            Note "如果只是想确认系统状态：ssh root@$DeviceIp"
             Note '如果是要换 U-Boot：mtd0 在 OpenWrt 下是只读的，得让 U-Boot 自己刷自己 ——'
             Note '  见 README「mtd0 写不进去时，改 U-Boot 环境」和「需要刷 mtd0 时：让 U-Boot 自己刷自己」'
             throw "OpenWrt 已安装，跳过刷机"
@@ -907,7 +935,8 @@ try {
 
         if ($needTftp -and -not $sawTftp -and (Test-Path $tftpLog)) {
             $hit = Get-Content $tftpLog -EA SilentlyContinue |
-                   Where-Object { $_ -match '->\s*192\.168|NOT FOUND' } | Select-Object -Last 1
+                   Where-Object { $_ -match ('->\s*' + [regex]::Escape($ServerIp)) -or $_ -match 'NOT FOUND' } |
+                   Select-Object -Last 1
             if ($hit) {
                 $sawTftp = $true
                 Ok ("U-Boot 来取文件了: " + $hit.Trim())
@@ -930,7 +959,7 @@ try {
             } else {
                 Note '按顺序查这几条：'
                 Note '  1) TFTP 服务还活着吗（UDP 69 在监听）'
-                Note '  2) 网线在 LAN 口、PC 是 192.168.1.2/24 吗'
+                Note "  2) 网线在 LAN 口、PC 是 $ServerIp/$PrefixLength 吗"
                 Note '  3) 防火墙拦了入站吗'
             }
             Note '接串口 J1（115200 8N1, 3.3V TTL）能直接看到 U-Boot 每一句输出'
@@ -1029,7 +1058,7 @@ try {
     KeyVal 'Image'   (Split-Path $img -Leaf)
     KeyVal 'Device'  $DeviceIp
     Write-Host ''
-    Note '下一步：ssh root@192.168.1.1 设密码；可选做第 10 节释放 flash 空间'
+    Note "下一步：ssh root@$DeviceIp 设密码；可选做第 10 节释放 flash 空间"
     Rule 'DarkGreen'
 }
 catch {

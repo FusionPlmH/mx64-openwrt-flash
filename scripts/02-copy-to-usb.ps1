@@ -1,7 +1,7 @@
 ﻿# 把 files\ 里的文件拷到 U 盘根目录，并逐个校验 SHA256。
 #   powershell -ExecutionPolicy Bypass -File scripts\02-copy-to-usb.ps1 -Drive E:\
 #
-# 不格式化！U 盘需要提前分好一个 FAT32 分区（MBR）。
+# 不格式化！U 盘需要提前分好一个 FAT16/FAT32 分区（MBR）。
 # 如果 U 盘只有一个分区，-Drive 直接给盘符就行。
 
 param(

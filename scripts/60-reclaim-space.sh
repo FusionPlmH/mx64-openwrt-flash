@@ -1,6 +1,6 @@
 #!/bin/sh
 # 在 OpenWrt 里执行，删掉原厂留下的无用 UBI 卷，把空间还给 rootfs_data。
-#   cd /tmp && wget http://192.168.1.2/60-reclaim-space.sh && sh 60-reclaim-space.sh
+#   cd /tmp && wget http://<PC_IP>/60-reclaim-space.sh && sh 60-reclaim-space.sh
 #
 # 删完要再跑一次 sysupgrade（同一个镜像），OpenWrt 才会扩建 rootfs_data。
 # 绝对不要删 board-config。

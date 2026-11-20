@@ -1,7 +1,7 @@
 #!/bin/sh
 # 在 OpenWrt 里执行 sysupgrade。
-#   cd /tmp && wget http://192.168.1.2/50-sysupgrade.sh
-#   sh 50-sysupgrade.sh /tmp/openwrt-25.12.6-bcm53xx-generic-meraki_mx64-squashfs.sysupgrade.bin
+#   cd /tmp && wget http://<PC_IP>/50-sysupgrade.sh
+#   sh 50-sysupgrade.sh /tmp/openwrt-<版本>-bcm53xx-generic-meraki_mx64-squashfs.sysupgrade.bin
 #
 # -n 表示不保留旧配置（全新安装）。想保留就把它去掉。
 

@@ -11,7 +11,7 @@
 # 这种机器只能让 U-Boot 自己刷自己 —— 见 README
 # 「需要刷 mtd0 时：让 U-Boot 自己刷自己」。
 #
-# 用法（设备上，ssh root@192.168.1.1）：
+# 用法（设备上，ssh root@<设备IP>）：
 #   sh 30-write-uboot-from-openwrt.sh              # 用过渡固件自带的 /root/uboot_mx64
 #   sh 30-write-uboot-from-openwrt.sh /tmp/x.bin   # 用自己传上去的镜像（例如 uboot_ng.bin）
 #

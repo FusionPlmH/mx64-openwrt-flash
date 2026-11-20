@@ -4,9 +4,11 @@
     python 70-tftp-server.py                    # 服务 ../files，UDP 69
     python 70-tftp-server.py --dir files --port 6969
 
-U-Boot 的 tftpboot 固定连 UDP 69，所以默认端口需要管理员权限：
-    Windows: 以管理员身份运行 PowerShell
-    Linux:   sudo
+U-Boot 的 tftpboot 默认连 UDP 69：
+    Windows: 绑定低端口不需要管理员
+    Linux/macOS: 绑定 69 需要 root（sudo）
+
+只想本地测试时可以 --port 6969，但 U-Boot 那边要显式改端口才能连。
 
 实现 RFC1350 octet 模式，512 字节块，不协商选项（U-Boot 未设 tftpblocksize 时
 也不会请求选项）。不做上传。

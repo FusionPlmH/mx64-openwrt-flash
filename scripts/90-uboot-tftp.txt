@@ -2,8 +2,8 @@ U-Boot 里用 TFTP 升级 bootloader / 引导 initramfs（不用按 reset、不�
 ============================================================================
 
 前提：已经刷上本项目编译的 U-Boot（mx64-ng-2012.10-v2 或更新，带 flash_uboot 命令）。
-      PC 网卡设成 192.168.1.2/24，TFTP 服务器跑在 192.168.1.2:69
-      （kit 里：python scripts\70-tftp-server.py，需要管理员权限）。
+      PC 网卡与设备同网段（下面按惯例用 192.168.1.2/24），TFTP 服务器跑在 PC 的 IP:69
+      （kit 里：python scripts\70-tftp-server.py；Windows 不需要管理员，Linux 需要 root）。
 
 
 0) 上电后 3 秒内按任意键，停在 U-Boot 提示符（CONFIG_BOOTDELAY=3）
@@ -26,9 +26,9 @@ U-Boot 里用 TFTP 升级 bootloader / 引导 initramfs（不用按 reset、不�
 
 2) 设置网络（只需一次，saveenv 之后就不用再设）
 
-   setenv ethaddr 0c:8d:db:90:0a:a0        <- 换成你机器标签上的 MAC
-   setenv ipaddr 192.168.1.10
-   setenv serverip 192.168.1.2
+   setenv ethaddr 00:18:0a:00:01:02        <- 换成你机器标签上的 MAC
+   setenv ipaddr 192.168.1.10              <- 同网段任意空闲地址
+   setenv serverip 192.168.1.2             <- 换成 PC 的 IP
    setenv netmask 255.255.255.0
    ping 192.168.1.2
    saveenv
