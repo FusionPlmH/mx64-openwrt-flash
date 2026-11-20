@@ -25,7 +25,11 @@ done
 
 # board-config 卷是设备身份信息，绝对不要删，单独打包一份
 echo "== 备份 board-config 卷 =="
-ubiattach -m 5 2>/dev/null
+# ubi 分区的 mtd 编号各家不同（clayface 布局是 mtd6），按名字找
+UBI_MTD=$(awk '$4 ~ /"ubi"/ {sub(/mtd/,"",$1); sub(/:/,"",$1); print $1; exit}' /proc/mtd)
+[ -n "$UBI_MTD" ] || UBI_MTD=6
+echo "   ubi 在 mtd$UBI_MTD"
+ubiattach -m "$UBI_MTD" 2>/dev/null
 mkdir -p /mnt/bc
 if mount -t ubifs ubi0:board-config /mnt/bc 2>/dev/null; then
 	tar czf board-config.tar.gz -C /mnt/bc . 2>/dev/null

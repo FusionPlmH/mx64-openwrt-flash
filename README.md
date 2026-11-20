@@ -65,12 +65,13 @@ ubinfo -a                     # 有 rootfs_data 卷 => 已装好
 
 ```
 README.md                    本文件
-SHA256SUMS                   files/ 下所有文件的校验值
+SHA256SUMS                   files/ 下所有文件的校验值（00-flash.ps1 第 1 阶段会逐个核对）
 files/
-  uboot_ng.bin               本项目的 U-Boot（598,172 B，需 1 MiB 分区）
+  uboot_ng.bin               本项目的 U-Boot v5（598,268 B，需 1 MiB 分区）
+  uboot-env.bin              U-Boot 环境变量块（含 config_dts=config@4，给老版本兜底）
   uboot_mx64                 1 MiB boot 分区用的 clayface U-Boot（587,312 B）
   uboot_mx64_small           512 KiB boot 分区用的 clayface U-Boot（524,288 B）
-  mtd-rw.ko                  mtd0 写保护解锁模块（仅 ro=1 时需要）
+  mtd-rw.ko                  mtd0 写保护解锁模块（仅 ro=1 时需要，只对原厂 2.6.36 内核有效）
   mtd                        busybox mtd 工具（解锁后用 mtd write）
   openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin        OpenWrt RAM 系统 B0+（FIT）
   openwrt-bcm53xx-generic-meraki_mx64-a0-initramfs.bin     OpenWrt RAM 系统 A0（FIT）
@@ -81,14 +82,17 @@ files/
 scripts/
   00-flash.ps1               PC 一键：起服务 + telnet 驱动设备，全自动（见下）
   01-serve-http.ps1          只想起 HTTP 服务（手动敲命令时用）
-  70-tftp-server.py          只读 TFTP 服务器（UDP 69，给 U-Boot 用）
+  70-tftp-server.py          只读 TFTP 服务器（UDP 69，支持 blksize 协商，给 U-Boot 用）
   02-copy-to-usb.ps1         把 files/ 拷到 U 盘并校验
   03-fetch-backup.ps1        把设备 /tmp/backup 拉回 PC
-  30-write-uboot-from-openwrt.sh  过渡固件里把 512 KiB 布局换成 1 MiB
+  30-write-uboot-from-openwrt.sh  过渡固件里把 512 KiB 布局换成 1 MiB（会先探 mtd0 可写性）
   40-backup-flash.sh         OpenWrt 里备份原厂分区（可选）
   50-sysupgrade.sh           OpenWrt 里执行 sysupgrade
   60-reclaim-space.sh        OpenWrt 里删掉原厂 UBI 卷，扩 rootfs_data
   90-uboot-tftp.txt          U-Boot 提示符下的命令清单（TFTP 引导 / flash_uboot）
+tools/
+  mkenv.py                   从 U-Boot 二进制生成带正确 CRC 的 u-boot-env 块
+backup/                      -Check 时自动存的原厂 mtd0 头部（.gitignore 忽略）
 ```
 
 ## 一键刷机（PC 驱动）
@@ -238,7 +242,9 @@ sync
 reboot
 ```
 
-## 0. 先决策
+## 分步细节（脚本不适用时逐条对着做）
+
+### 0. 先决策
 
 | 要确认的事 | 怎么查 | 后果 |
 |---|---|---|
@@ -248,29 +254,29 @@ reboot
 
 `00-flash.ps1` 会自动做这三件事并给出结论（`-Check` 只看不写）。
 
-## 1. 准备 U 盘（只有走 USB 路径需要）
+### 1. 准备 U 盘（只有走 USB 路径需要）
 
 - MBR 分区表，第一个分区 FAT32（wiki 建议 FAT16 128 MB）
 - 根目录只放本工具包的文件，不要留旧的 `openwrt-*`
 - 写入：`powershell -ExecutionPolicy Bypass -File scripts\02-copy-to-usb.ps1 -Drive E:\`
 
-## 2. PC 侧服务
+### 2. PC 侧服务
 
 一般由 `00-flash.ps1` 自动起。想单独起：
 
 ```powershell
-python scripts\70-tftp-server.py                                   # TFTP，UDP 69，要管理员
+python scripts\70-tftp-server.py                                   # TFTP，UDP 69（Windows 不需要管理员）
 powershell -ExecutionPolicy Bypass -File scripts\01-serve-http.ps1 # HTTP，:8000
 ```
 
-## 3. 进入 diagnostic mode
+### 3. 进入 diagnostic mode
 
 1. 网线插 LAN 口
 2. 按住 reset 上电 → 前灯橙色 → **白灯闪两下**时松手
 3. 松手后等约 15 秒，灯熄灭后变绿；变彩虹色就断电重来
 4. `telnet 192.168.1.1`
 
-## 4. 512 KiB 机器（过渡固件换 1 MiB 布局）
+### 4. 512 KiB 机器（过渡固件换 1 MiB 布局）
 
 只有这一节要 `-initramfs-kernel.bin`：
 
@@ -278,10 +284,12 @@ powershell -ExecutionPolicy Bypass -File scripts\01-serve-http.ps1 # HTTP，:800
    放进 U 盘或 TFTP 根目录
 2. 按住 reset 上电引导进过渡固件（`uboot_mx64_small` 是按键触发的）
 3. `ssh root@192.168.1.1`，跑 `scripts/30-write-uboot-from-openwrt.sh`
+   （脚本会先探 mtd0 可写性；出厂带写保护的机器在 OpenWrt 下写不了，
+   那种机器只能走「让 U-Boot 自己刷自己」）
 4. **不要重启**，直接 sysupgrade
 5. 换完第一次启动要重做 Shmoo 校准，会很慢（几分钟）
 
-## 5. 启动 OpenWrt（正常路径）
+### 5. 启动 OpenWrt（正常路径）
 
 用本项目的 U-Boot 时**不用按 reset**：
 
@@ -296,13 +304,13 @@ U 盘也不行          -> 自动 tftp_boot（网络）
 
 开关：`enable_usb_boot` / `enable_tftp_boot` / `disable_ubi_boot`，`setenv` 后 `saveenv`。
 
-## 6. 备份原厂分区（可选，**默认跳过**）
+### 6. 备份原厂分区（可选，**默认跳过**）
 
 自动流程不做备份：备份只能在 initramfs 里做（diag 模式没有 scp），而自动流程第 6 阶段上传完
 sysupgrade 就重启了。要备份就手动：先引导 initramfs，设备上跑 `40-backup-flash.sh`，
 再用 `03-fetch-backup.ps1` 拉回 PC。
 
-## 7. sysupgrade
+### 7. sysupgrade
 
 `00-flash.ps1` 第 6 阶段自动完成。手动：
 
@@ -317,7 +325,7 @@ sysupgrade -n /tmp/openwrt-25.12.6-bcm53xx-generic-meraki_mx64-squashfs.sysupgra
 
 装完默认 `192.168.1.1`，`root` 无密码（立刻设密码）。
 
-## 8. 释放被原厂占用的 flash（可选）
+### 8. 释放被原厂占用的 flash（可选）
 
 ```sh
 wget http://192.168.1.2:8000/60-reclaim-space.sh && sh 60-reclaim-space.sh
@@ -326,7 +334,7 @@ wget http://192.168.1.2:8000/60-reclaim-space.sh && sh 60-reclaim-space.sh
 删掉 `part.old` / `storage` / `diagnostic1` / `part.safe`，**不要动 `board-config`**；
 然后再跑一次 sysupgrade，`rootfs_data` 会扩建到剩余全部空间。
 
-## 9. 本项目的 U-Boot 额外能力
+### 9. 本项目的 U-Boot 额外能力
 
 | 命令 | 作用 |
 |---|---|
@@ -338,14 +346,8 @@ wget http://192.168.1.2:8000/60-reclaim-space.sh && sh 60-reclaim-space.sh
 | `bootbk <addr> <part>` | 启动 Meraki bootkernel（校验头部 CRC32） |
 | `mx64info` | 打印版本、SoC、reset 状态、环境变量 |
 
-用 TFTP 升级 U-Boot（不用 diag、不用 U 盘、不用 reset）：
-
-```
-setenv ipaddr 192.168.1.10
-setenv serverip 192.168.1.2
-flash_uboot uboot_ng.bin 100000 confirm
-reset
-```
+用 TFTP 升级 U-Boot 不用 diag、不用 U 盘、也不用按 reset，走法见
+[「需要刷 mtd0 时：让 U-Boot 自己刷自己」](#需要刷-mtd0-时让-uboot-自己刷自己)。
 
 ## 故障排查
 
@@ -415,7 +417,7 @@ python tools\mkenv.py files\uboot_ng.bin files\uboot-env-flash.bin `
 
 刷完记得把 `bootcmd` 换回默认（去掉 `flash_uboot`），否则每次开机都会重刷一遍。
 
-### B0+ 的坑（OpenWrt 装完起不来的最常见原因）
+## B0+ 的坑（OpenWrt 装完起不来的最常见原因）
 
 U-Boot 用 `bootm ${loadaddr}#${config_dts}` 启动，而装进 NAND 的 FIT 里
 **只有 `config@4`（B0+）或只有 `config@2`（A0）**，取决于你刷的 sysupgrade 镜像。
@@ -463,6 +465,27 @@ if (argc >= 2 && !strcmp(argv[1], "set")) {
 
 `files/uboot-env.bin` 里仍然带 `config_dts=config@4`，那是给老版本 U-Boot 兜底用的��
 v4 下不影响（C 代码看到已有值就不覆盖）。
+
+## U-Boot 版本历史
+
+`files/uboot_ng.bin` 经历过的每一次修正，都是真机刷坏之后才发现的。凡是涉及 U-Boot
+shell 条件判断的地方都栽过，最后关键逻辑都被挪进了 C。
+
+| 版本 | 修了什么 | 留下的坑 |
+|---|---|---|
+| v2 | 初始可刷版本 | `soc_dtscheck` 用 `if test $? = 1`，而 hush 拿不到命令返回值 → 永远选 `config@2`(A0) |
+| v3 | 改成 `getsocrev set`，由命令自己 `setenv` | `if test -z "${config_dts}"` 在变量为空时退化成 `test -z`（只剩 2 个参数），而 `cmd_test.c` 里 `if (argc < 3) return 1;` 返回假 → `then` 分支永不执行 |
+| v4 | `soc_dtscheck=getsocrev set` 无条件调用，判断挪进 C | `ipaddr` 编译默认值 `192.168.0.1` 和 `serverip 192.168.1.2` 跨网段 → U-Boot 不 ACK OACK，TFTP 死在 `block 1/11779` |
+| **v5** | 网络三件套同网段（`192.168.1.10` / `192.168.1.2` / `255.255.255.0`），并去掉 `tftp_boot` 里的 `test -z` 判断 | 当前版本 |
+
+**通用教训**：U-Boot 的 shell 条件判断不可靠 —— `$?` 拿不到返回值，`test` 在参数不足时
+静默返回假。任何"变量为空就做某事"的判断都不要写在 env 脚本里。
+
+版本可以用 `mx64info` 的 `Tag` 行确认，或直接从设备读：
+
+```sh
+dd if=/dev/mtd0 bs=4096 count=146 2>/dev/null | strings | grep -o 'mx64-ng-[0-9a-zA-Z\.-]*'
+```
 
 ## 参考
 
