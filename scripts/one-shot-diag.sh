@@ -10,8 +10,16 @@
 #   sh one-shot-diag.sh tftp://192.168.1.2 http://192.168.1.2:8000
 #   sh one-shot-diag.sh http://192.168.1.2:8000
 #
+#   只看结论、什么都不写:
+#   sh one-shot-diag.sh --check
+#
 # 刷完断电，然后按 README 第 7 节引导 initramfs。
 # 只写 mtd0（boot 分区），不碰其它分区。
+
+CHECK=0
+case "$1" in
+--check|-n|--dry-run) CHECK=1; shift ;;
+esac
 
 BASE1="${1:-tftp://192.168.1.2}"
 BASE2="${2:-http://192.168.1.2:8000}"
@@ -83,6 +91,31 @@ fi
 NEED_UNLOCK=no
 [ "$ro" = "1" ] && NEED_UNLOCK=yes
 echo "   决定: TARGET=$TARGET NEED_UNLOCK=$NEED_UNLOCK"
+
+if [ "$CHECK" = "1" ]; then
+	echo
+	echo "==== --check：只看结论，什么都没写 ===="
+	case "$VARIANT" in
+	a0) echo "  SoC      : A0  -> initramfs 用 openwrt-bcm53xx-generic-meraki_mx64-a0-initramfs.bin（U-Boot 镜像本身不分 A0/B0+）" ;;
+	b0) echo "  SoC      : B0+ -> initramfs 用 openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin" ;;
+	*)  echo "  SoC      : 读不到（devmem/devmem2 都没有）；先确认标签/年份再动手" ;;
+	esac
+	echo "  mtd0     : $mtd0size ($mtd0dec 字节)"
+	echo "  刷哪个   : $TARGET ($EXP_SIZE 字节, 会用内嵌 SHA512 校验)"
+	if [ "$NEED_UNLOCK" = "yes" ]; then
+		echo "  解锁     : 需要（insmod mtd-rw.ko i_want_a_brick=1），之后用 mtd write"
+	else
+		echo "  解锁     : 不需要，直接 dd 到 /dev/mtdblock0"
+	fi
+	if [ "$TARGET" = "uboot_mx64_small" ]; then
+		echo "  后续     : 512 KiB 分区 -> 还要走第 6 节（过渡固件换 1 MiB 布局）"
+	else
+		echo "  后续     : 断电后直接引导 openwrt-bcm53xx-...-initramfs.bin（第 7 节），不需要过渡固件"
+	fi
+	echo
+	echo "确认无误后去掉 --check 再跑一次就会写入。"
+	exit 0
+fi
 
 echo "==== 2/6 下载 $TARGET ===="
 cd /tmp || die "进不去 /tmp"

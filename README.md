@@ -54,6 +54,45 @@ mx64info                      # 本项目的 U-Boot 才有这条命令
 判断口诀：**能 `df -h` 看到 `/overlay` 有几百 MB，就说明 OpenWrt 已经落到 NAND 上了**，
 那 `-initramfs-kernel.bin` 这一整套过渡流程你已经走完（或者根本不需要走）。
 
+## 脚本已经替你做掉的判断
+
+`one-shot-diag.sh` 会自己按下表决定，**不需要你选任何东西**：
+
+| 判断项 | 依据 | 结果 |
+|---|---|---|
+| 刷哪个 U-Boot | `awk '/^mtd0:/{print $2}' /proc/mtd` | `≥ 0x100000` → `uboot_mx64`；否则 → `uboot_mx64_small` |
+| 要不要解锁 mtd0 | `cat /sys/block/mtdblock0/ro` | `1` → `insmod mtd-rw.ko i_want_a_brick=1` 并回读确认变成 `0`；`0` → 直接 `dd` |
+| 写还是 dd | 上一条的结论 | 解锁过 → `mtd write`；没锁 → `dd of=/dev/mtdblock0` |
+| A0 还是 B0+ | `devmem 0x18000000` 的 `0x3F00`–`0x3F03` | 只影响**之后**用哪个 initramfs 文件名（U-Boot 镜像本身不分 A0/B0+） |
+| 传输方式 | 命令行参数 / 默认值 | 先 TFTP，失败回退 HTTP；两个都失败才退出 |
+| 文件对不对 | 内嵌的期望长度 + SHA512 | 不符就 `!!` 停在第 3 步，绝不写 |
+| 写完对不对 | 回读前 64 KiB 比对 | 不一致 → `!!` 让你重刷 |
+
+想先看结论再决定要不要刷，用 `--check`（只读，不写任何东西）：
+
+```sh
+sh one-shot-diag.sh --check
+```
+
+输出示例：
+
+```
+==== 1/6 检测设备 ====
+   chip 0x18000000 = 0x3F040000 -> b0
+   mtd0 size       = 00100000 (1048576 bytes)
+   mtd0 read-only  = 1
+   决定: TARGET=uboot_mx64 NEED_UNLOCK=yes
+
+==== --check：只看结论，什么都没写 ====
+  SoC      : B0+ -> initramfs 用 openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin
+  mtd0     : 00100000 (1048576 字节)
+  刷哪个   : uboot_mx64 (587312 字节, 会用内嵌 SHA512 校验)
+  解锁     : 需要（insmod mtd-rw.ko i_want_a_brick=1），之后用 mtd write
+  后续     : 断电后直接引导 openwrt-bcm53xx-...-initramfs.bin（第 7 节），不需要过渡固件
+```
+
+PC 侧也能只看：`00-flash.ps1 -Check`（同样的结论，走 telnet 拿回来）。
+
 ## 先回答几个常见问题
 
 | 问题 | 答案 |

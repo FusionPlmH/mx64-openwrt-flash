@@ -21,6 +21,7 @@ param(
     [ValidateSet('tftp', 'http')]
     [string]$Transport = 'tftp',
     [int]$TimeoutSec = 600,
+    [switch]$Check,
     [switch]$DryRun
 )
 
@@ -57,7 +58,8 @@ if ($Transport -eq 'tftp') {
 } else {
     $primary = $httpBase; $fallback = $tftpBase
 }
-$bootstrap = "cd /tmp && wget $httpBase/one-shot-diag.sh && sh one-shot-diag.sh $primary $fallback"
+$checkArg = if ($Check) { '--check ' } else { '' }
+$bootstrap = "cd /tmp && wget $httpBase/one-shot-diag.sh && sh one-shot-diag.sh $checkArg$primary $fallback"
 
 Say ""
 Say "==== 计划 ====" 'Cyan'
@@ -65,6 +67,7 @@ Say "  服务目录 : $stage"
 Say "  主传输   : $Transport  ($primary)"
 Say "  备用     : $fallback"
 Say "  设备     : $DeviceIp (telnet 23)"
+Say "  模式     : $(if ($Check) { '--check（只看结论，不写 NAND）' } else { '真刷' })"
 Say "  注入命令 : $bootstrap"
 Say ""
 
