@@ -253,22 +253,46 @@ if ($busy.Count -gt 0) {
 Ok "端口空闲（UDP 69 / TCP $Port）"
 
 # ---- 本地镜像完整性：避免刷进旧版本或下坏的镜像 ----
-$sidecars = @(Get-ChildItem $filesDir -File | Where-Object { $_.Name -match '\.sha(256|512)$' })
-$badSum = @()
-foreach ($sc in $sidecars) {
-    $tgt = Join-Path $filesDir $sc.BaseName
-    if (-not (Test-Path $tgt)) { $badSum += "$($sc.Name) 对应的 $($sc.BaseName) 不存在"; continue }
-    $alg = if ($sc.Extension -eq '.sha256') { 'SHA256' } else { 'SHA512' }
-    $want = (((Get-Content $sc.FullName -Raw) -split '\s+') | Where-Object { $_ }) | Select-Object -First 1
-    $got = (Get-FileHash $tgt -Algorithm $alg).Hash
-    if ($got -ne $want.ToUpper()) { $badSum += "$($sc.BaseName) $alg 不符" }
+# 优先用 SHA256SUMS（覆盖 files/ 下全部文件）；没有它才退回逐个 sidecar
+$sumsFile = Join-Path $kitRoot 'SHA256SUMS'
+if (Test-Path $sumsFile) {
+    $badSum = @()
+    $checked = 0
+    foreach ($line in Get-Content $sumsFile) {
+        if ($line -notmatch '^([0-9a-fA-F]{64})\s+(.+)$') { continue }
+        $want = $matches[1].ToLower()
+        $rel = $matches[2].Trim()
+        $tgt = Join-Path $kitRoot ($rel -replace '/', '\')
+        if (-not (Test-Path $tgt)) { $badSum += "$rel 不存在"; continue }
+        $checked++
+        if ((Get-FileHash $tgt -Algorithm SHA256).Hash.ToLower() -ne $want) { $badSum += "$rel SHA256 不符" }
+    }
+    if ($badSum.Count -gt 0) {
+        Bad 'SHA256SUMS 校验失败：'
+        foreach ($b in $badSum) { Note "  $b" }
+        Note '镜像被改过或下载不完整。别刷，先把 files/ 恢复成仓库里的版本'
+        throw '镜像校验失败'
+    }
+    Ok "SHA256SUMS 覆盖的 $checked 个文件全部匹配"
+} else {
+    $sidecars = @(Get-ChildItem $filesDir -File | Where-Object { $_.Name -match '\.sha(256|512)$' })
+    $badSum = @()
+    foreach ($sc in $sidecars) {
+        $tgt = Join-Path $filesDir $sc.BaseName
+        if (-not (Test-Path $tgt)) { $badSum += "$($sc.Name) 对应的 $($sc.BaseName) 不存在"; continue }
+        $alg = if ($sc.Extension -eq '.sha256') { 'SHA256' } else { 'SHA512' }
+        $want = (((Get-Content $sc.FullName -Raw) -split '\s+') | Where-Object { $_ }) | Select-Object -First 1
+        $got = (Get-FileHash $tgt -Algorithm $alg).Hash
+        if ($got -ne $want.ToUpper()) { $badSum += "$($sc.BaseName) $alg 不符" }
+    }
+    if ($badSum.Count -gt 0) {
+        Bad '镜像校验失败：'
+        foreach ($b in $badSum) { Note "  $b" }
+        throw '镜像损坏或版本不符'
+    }
+    Warn "没有 SHA256SUMS，只校验了 $($sidecars.Count) 个带 sidecar 的文件"
+    Ok ("{0} 个镜像的校验和都对得上" -f $sidecars.Count)
 }
-if ($badSum.Count -gt 0) {
-    Bad '镜像校验失败：'
-    foreach ($b in $badSum) { Note "  $b" }
-    throw '镜像损坏或版本不符'
-}
-Ok ("{0} 个镜像的校验和都对得上" -f $sidecars.Count)
 
 # ---- U-Boot 版本标记：一眼确认刷进去的是哪个构建 ----
 $ngPath = Join-Path $filesDir 'uboot_ng.bin'
