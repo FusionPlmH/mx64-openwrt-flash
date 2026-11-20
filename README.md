@@ -103,6 +103,7 @@ cd "C:\Users\Peter\Desktop\cisco mx64\mx64-openwrt-flash-kit"
 
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -DryRun     # 看计划
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Check      # 只读设备、出结论
+powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Probe      # 只验证 mtd 工具，不擦不写
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1             # 真刷（默认 TFTP）
 ```
 
@@ -140,6 +141,7 @@ reboot
 | 开关 | 作用 |
 |---|---|
 | `-Check` | 只探测并给出结论，**不写 NAND** |
+| `-Probe` | 只验证设备上的 `mtd` 工具（跑 `unlock`，不擦不写），确认参数写法 |
 | `-DryRun` | 只打印计划 |
 | `-SkipSysupgrade` | 刷完 U-Boot、进了 initramfs 就停 |
 | `-Uboot clayface` | 改刷 clayface 的 `uboot_mx64`（默认 `uboot_ng.bin`） |
@@ -178,24 +180,26 @@ powershell -ExecutionPolicy Bypass -File scripts\01-serve-http.ps1
 
 ```sh
 cat /proc/mtd
-cat /sys/block/mtdblock0/ro
+cat /sys/block/mtdblock0/ro        # 1 = 有写保护（但 mtd-rw 加载后它也不会变，见下）
 devmem 0x18000000
 
 cd /tmp
+rm -f uboot_ng.bin                 # 原厂 wget 不覆盖已有文件！
 wget http://192.168.1.2:8000/uboot_ng.bin
-wc -c < uboot_ng.bin              # 应该是 598172
-md5sum uboot_ng.bin               # 648a8d98fdd6a3fa0a3f45042519e755
+ls -l uboot_ng.bin                 # 应该是 598172 字节（没有 wc 时用这个）
 
-# 只有 ro=1 才需要这两步
+# 只有 ro=1 才需要解锁
+rm -f mtd-rw.ko mtd
 wget http://192.168.1.2:8000/mtd-rw.ko
 wget http://192.168.1.2:8000/mtd && chmod +x mtd
 insmod mtd-rw.ko i_want_a_brick=1
-cat /sys/block/mtdblock0/ro       # 要变成 0
+cat /proc/modules | head -20       # 有 mtd_rw 这行就算成功（ro 仍是 1，正常）
+dmesg | tail -5                    # 应该有 mtd-rw: mtd0: setting writeable flag
 
-# 写入（ro 已解锁用第一条，否则用第二条）
-./mtd write /tmp/uboot_ng.bin /dev/mtd0
-dd if=/tmp/uboot_ng.bin of=/dev/mtdblock0
+# 写入：这个 mtd 只认 /dev/mtd0 全路径；-f 跳过 trx 校验
+./mtd -f write /tmp/uboot_ng.bin /dev/mtd0
 
+dd if=/dev/mtd0 bs=512 count=1 | hexdump -C    # 有 hexdump 的话看头是不是 07 05 00 ea
 sync
 reboot
 ```
@@ -316,8 +320,11 @@ reset
 | `192.168.1.1:23` 连不上 | 设备没进 diag（正常启动时 LAN 是 `192.168.0.1`）；网线要插 LAN1-4 不是 WAN；进 diag 要 20~30 秒 |
 | 白灯闪两下后一直橙 | diag Linux 没起来；断电重试 2-3 次；仍不行请接串口（J1，115200 8N1） |
 | `wget` 404 | HTTP 服务目录不对，或文件名打错 |
-| `mtd-rw.ko` insmod 报错 | 内核不匹配；先确认 `/sys/block/mtdblock0/ro` 是不是真的 1 |
-| 解锁后 `ro` 还是 1 | 不要继续写；检查 dmesg 有没有 `_mtd-rw: mtd0: setting writeable flag_` |
+| `wget: can't open 'xxx': File exists` | 原厂 busybox 的 `wget` **不覆盖**已有文件。脚本已自动 `rm -f` 后重下；手敲命令时自己先删 |
+| `mtd-rw.ko` insmod 报错 | 内核不匹配，看 dmesg 的 vermagic / 符号版本报错 |
+| insmod 报 `File exists` | 模块之前已经加载过，**不是失败**；看 `/proc/modules` 有没有 `mtd_rw` |
+| 解锁后 `/sys/block/mtdblock0/ro` 还是 1 | **正常，别管它**。那是块设备的静态属性，`mtd-rw` 改的是 `mtd->flags`，sysfs 不会跟着变。判据应该是 `/proc/modules` 里有 `mtd_rw`，或 dmesg 有 `mtd-rw: mtd0: setting writeable flag` |
+| `mtd: Could not open mtd device: mtd0` | 这个 `mtd` 只认 **`/dev/mtd0` 全路径**，传 `mtd0` 或 label `boot` 都不行 |
 | 回读 md5 不一致 | 不要断电，重跑一次写入 |
 | 换 U-Boot 后长时间橙白闪 | Shmoo 校准中；等几分钟，不行断电再上电；仍失败用 U 盘 initramfs 重装，**别再刷 U-Boot** |
 | 装完只有 ~370 MiB 可用 | 见第 8 节 |
