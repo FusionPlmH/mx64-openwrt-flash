@@ -1,0 +1,16 @@
+# ?????????????.sh ??? LF
+*.sh            text eol=lf
+*.ps1           text eol=crlf
+*.md            text eol=lf
+SHA256SUMS      text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+# ??????????/????
+*.bin           binary
+*.ko            binary
+files/mtd       binary
+files/uboot_mx64        binary
+files/uboot_mx64_small  binary
+*.sha256        text eol=lf
+*.sha512        text eol=lf
