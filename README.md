@@ -3,6 +3,9 @@
 依据 <https://openwrt.org/toh/meraki/mx64> 整理，并把每一步做成了可复制的脚本。
 **刷 U-Boot 有变砖风险**，动手前请先读完「0. 先决策」和「故障排查」。
 
+本仓库: <https://github.com/FusionPlmH/mx64-openwrt-flash>
+配套 U-Boot 源码: <https://github.com/FusionPlmH/mx64-uboot-refresh>
+
 ## 目录内容
 
 ```
