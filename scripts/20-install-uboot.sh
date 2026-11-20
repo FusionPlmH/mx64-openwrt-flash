@@ -57,8 +57,12 @@ if [ "$NEED_UNLOCK" = "yes" ]; then
 	insmod /tmp/mtd-rw.ko i_want_a_brick=1 || echo "   (insmod 返回非 0，检查下面的 dmesg)"
 	dmesg | tail -5
 	echo "   上面应出现: _mtd-rw: mtd0: setting writeable flag_"
-	echo "   没有出现就不要继续，Ctrl-C 退出"
-	sleep 5
+	ro=$(cat /sys/block/mtdblock0/ro 2>/dev/null)
+	if [ "$ro" != "0" ]; then
+		echo "!! 解锁失败（mtd0 ro=$ro），不要继续"
+		exit 1
+	fi
+	echo "   mtd0 ro=0，已解锁"
 fi
 
 echo "== 写入 =="
