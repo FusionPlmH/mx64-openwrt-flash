@@ -30,7 +30,8 @@ param(
     [ValidateSet('ng', 'clayface')]
     [string]$Uboot = 'ng',
     [string]$SysupgradeFile = '',
-    [int]$BootTimeoutSec = 420,
+    [int]$BootTimeoutSec = 300,
+    [int]$HintSec = 45,
     [int]$SshTimeoutSec = 240,
     [switch]$Check,
     [switch]$SkipSysupgrade,
@@ -708,9 +709,57 @@ try {
 
     Phase 4 '重启并等待 initramfs 起来'
     Note 'U-Boot 顺序：UBI（空）-> USB（没插）-> TFTP，所以会自己来取镜像'
-    if (-not (Wait-Port -IP $DeviceIp -PortNo 22 -TimeoutSec $BootTimeoutSec -Label 'initramfs ssh')) {
-        Bad '等不到设备的 22 端口'
-        Note '检查：服务是否还在、网线是否在 LAN 口、U-Boot 是否真的写进去了'
+
+    # 等 22 端口是"结果"，过程要盯着 TFTP 日志：
+    # U-Boot 只有在真跑 tftpboot 时才会起网卡，日志一有请求就说明它活着。
+    $t0 = Get-Date
+    $sawTftp = $false
+    $hinted = $false
+    $booted = $false
+    while (((Get-Date) - $t0).TotalSeconds -lt $BootTimeoutSec) {
+        $el = [int]((Get-Date) - $t0).TotalSeconds
+
+        if (-not $sawTftp -and (Test-Path $tftpLog)) {
+            $hit = Get-Content $tftpLog -EA SilentlyContinue |
+                   Where-Object { $_ -match '->\s*192\.168|NOT FOUND' } | Select-Object -Last 1
+            if ($hit) {
+                $sawTftp = $true
+                Ok ("U-Boot 来取文件了: " + $hit.Trim())
+            }
+        }
+
+        if (Test-Port -IP $DeviceIp -PortNo 22 -Ms 800) { $booted = $true; break }
+
+        if (-not $sawTftp -and -not $hinted -and $el -ge $HintSec) {
+            $hinted = $true
+            Write-Host ''
+            Warn ("已经 $el 秒还没收到任何 TFTP 请求")
+            Note '可能原因（按概率）：'
+            Note '  1) U-Boot 在做 Shmoo 校准（首次启动正常，可能需要几分钟）'
+            Note '  2) U-Boot 卡在提示符 / 校验不过 —— 需要接串口看'
+            Note '  3) 写进 mtd0 的 U-Boot 起不来'
+            Note '判断办法：看灯的形态（白闪 3 下=USB boot，常橙=启动中，绿=起来了，橙白交替=UBI 失败）'
+            Note '        接串口 J1（115200 8N1）能直接看到 U-Boot 输出'
+            Note '继续等待中……'
+            Write-Host ''
+        }
+
+        if ($el % 10 -eq 0) {
+            $state = if ($sawTftp) { 'U-Boot 已取镜像，等系统起来' } else { '还没收到 TFTP 请求' }
+            Note ("  {0,4}s  {1}" -f $el, $state)
+        }
+        Start-Sleep -Milliseconds 1000
+    }
+
+    if (-not $booted) {
+        Bad ("等了 $BootTimeoutSec 秒，$DeviceIp`:22 还是连不上")
+        if (-not $sawTftp) {
+            Bad '全程没收到一次 TFTP 请求 -> U-Boot 根本没走到网络这一步'
+            Note '不要重复刷 U-Boot。先断电重上电再观察一次；仍不行就接串口'
+        } else {
+            Warn 'U-Boot 成功取了镜像，但系统没起来（可能内核/DTB 与 SoC 版本不匹配）'
+            Note '接串口看 bootm 之后的输出'
+        }
         throw '第 4 阶段失败'
     }
     Ok 'initramfs 已启动（ssh 端口打开）'
