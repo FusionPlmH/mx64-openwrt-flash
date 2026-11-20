@@ -93,20 +93,25 @@ function Wait-Port {
     return $false
 }
 
-function Read-Available {
-    param([System.IO.Stream]$Stream, [int]$Ms = 1000, [System.Text.Decoder]$Decoder)
+function Read-Bytes {
+    param([System.IO.Stream]$Stream, [int]$Ms = 1000)
     $buf = New-Object byte[] 8192
-    $bytes = New-Object System.Collections.Generic.List[byte]
+    $list = New-Object System.Collections.Generic.List[byte]
     $deadline = (Get-Date).AddMilliseconds($Ms)
     while ((Get-Date) -lt $deadline) {
         try {
             $n = $Stream.Read($buf, 0, $buf.Length)
             if ($n -le 0) { break }
-            for ($i = 0; $i -lt $n; $i++) { $bytes.Add($buf[$i]) }
+            for ($i = 0; $i -lt $n; $i++) { $list.Add($buf[$i]) }
         } catch { }
     }
-    if ($bytes.Count -eq 0) { return '' }
-    $arr = $bytes.ToArray()
+    return ,$list.ToArray()
+}
+
+function Read-Available {
+    param([System.IO.Stream]$Stream, [int]$Ms = 1000, [System.Text.Decoder]$Decoder)
+    $arr = Read-Bytes -Stream $Stream -Ms $Ms
+    if ($arr.Length -eq 0) { return '' }
     if (-not $Decoder) { $Decoder = [System.Text.Encoding]::UTF8.GetDecoder() }
     $chars = New-Object char[] ($arr.Length + 8)
     $cnt = $Decoder.GetChars($arr, 0, $arr.Length, $chars, 0)
@@ -289,29 +294,45 @@ try {
         ForEach-Object { Note ("  " + $_.Trim()) }
 
     # ---- PC 驱动的命令执行器：用成对标记包住命令，输出边界可靠 ----
+    $latin1 = [System.Text.Encoding]::GetEncoding(28591)
     function Invoke-Dev {
-        param([string]$Command, [int]$TimeoutSec = 120)
+        param([string]$Command, [int]$TimeoutSec = 120, [switch]$Binary)
         $id = Get-Random -Minimum 100000 -Maximum 999999
         $begin = "B$id"
         $end = "E$id"
         Send-Line -Stream $stream -Line "echo $begin; $Command; echo $end`$?"
-        $sb = New-Object System.Text.StringBuilder
+        $acc = New-Object System.Collections.Generic.List[byte]
         $deadline = (Get-Date).AddSeconds($TimeoutSec)
         $code = $null
-        $out = ''
+        $payload = @()
         while ((Get-Date) -lt $deadline) {
-            $chunk = Read-Available -Stream $stream -Ms 700 -Decoder $decoder
-            if ($chunk) { [void]$sb.Append($chunk) }
-            # 命令回显那一行也含标记，取最后一次匹配 = 真正的输出块
-            $ms = [regex]::Matches($sb.ToString(), "(?s)$begin\r?\n(.*?)\r?\n?$end(\d+)")
+            $chunk = Read-Bytes -Stream $stream -Ms 700
+            if ($chunk.Length -gt 0) { foreach ($b in $chunk) { $acc.Add($b) } }
+            if ($acc.Count -eq 0) { continue }
+            # 用 latin1 做字节安全的文本匹配（1 字节 = 1 字符），再切回字节
+            $s = $latin1.GetString($acc.ToArray())
+            $ms = [regex]::Matches($s, "(?s)$begin\r?\n(.*?)\r?\n?$end(\d+)")
             if ($ms.Count -gt 0) {
-                $hit = $ms[$ms.Count - 1]
-                $out = $hit.Groups[1].Value
+                $hit = $ms[$ms.Count - 1]      # 命令回显那行也含标记，取最后一次
+                $payload = $latin1.GetBytes($hit.Groups[1].Value)
                 $code = [int]$hit.Groups[2].Value
                 break
             }
         }
-        return @{ Code = $(if ($null -eq $code) { -1 } else { $code }); Output = $out }
+        if ($null -eq $code) { $code = -1 }
+        # telnet 会把 0xFF 转义成 0xFF 0xFF，还原回来
+        $out = New-Object System.Collections.Generic.List[byte]
+        $i = 0
+        while ($i -lt $payload.Length) {
+            if ($payload[$i] -eq 0xFF -and ($i + 1) -lt $payload.Length -and $payload[$i + 1] -eq 0xFF) {
+                $out.Add(0xFF); $i += 2
+            } else {
+                $out.Add($payload[$i]); $i += 1
+            }
+        }
+        $bytes = $out.ToArray()
+        if ($Binary) { return @{ Code = $code; Bytes = $bytes } }
+        return @{ Code = $code; Output = [System.Text.Encoding]::UTF8.GetString($bytes) }
     }
 
     # 1) 能力探测
@@ -336,6 +357,40 @@ try {
     $mtd0Hex = $mMtd.Groups[1].Value
     $mtd0Size = [Convert]::ToInt64($mtd0Hex, 16)
     Ok ("mtd0 = 0x{0} ({1} 字节)" -f $mtd0Hex, $mtd0Size)
+
+    # 布局安全校验：不看分区名（各家 diag 的分区表不一样），直接看 mtd0 里装的是什么
+    $names = @([regex]::Matches($mtdTxt, '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+    $mtd0Name = ''
+    $m0 = [regex]::Match($mtdTxt, '(?m)^mtd0:\s*[0-9a-fA-F]+\s+[0-9a-fA-F]+\s+"([^"]+)"')
+    if ($m0.Success) { $mtd0Name = $m0.Groups[1].Value }
+    Ok ("mtd0 名称 = '$mtd0Name'，分区: $($names -join ', ')")
+
+    Step '读 mtd0 前 512 字节（确认它真的是 bootloader）'
+    $head = Invoke-Dev 'dd if=/dev/mtdblock0 bs=512 count=1 2>/dev/null' -TimeoutSec 60 -Binary
+    if ($head.Code -ne 0 -or $head.Bytes.Length -lt 64) {
+        Bad "读不到 mtd0 头部（exit=$($head.Code), $($head.Bytes.Length) 字节）"
+        Note '不敢凭空写入，已停止'
+        throw '无法确认 mtd0 内容'
+    }
+    $headAscii = -join ($head.Bytes | ForEach-Object { if ($_ -ge 32 -and $_ -lt 127) { [char]$_ } else { '.' } })
+    $isArmBranch = ($head.Bytes.Length -ge 4 -and $head.Bytes[3] -eq 0xEA)
+    $looksUboot = ($headAscii -match 'U-Boot') -or ($headAscii -match 'Meraki')
+    Note ("头 4 字节: " + (($head.Bytes[0..3] | ForEach-Object { '{0:x2}' -f $_ }) -join ' '))
+    if ($headAscii -match '[\x20-\x7e]{8,}') {
+        $strs = @([regex]::Matches($headAscii, '[\x20-\x7e]{8,}') | ForEach-Object { $_.Value } | Select-Object -First 3)
+        foreach ($s in $strs) { Note ("文本: " + $s) }
+    }
+    if (-not $isArmBranch -or -not $looksUboot) {
+        Bad 'mtd0 里的内容不像 U-Boot（不是 ARM 跳转指令 / 没有 U-Boot 字符串）'
+        Note '这台设备的 boot 分区可能不是 bootloader，写进去会变砖，已停止'
+        throw 'mtd0 内容不符'
+    }
+    Ok 'mtd0 里确实是 U-Boot'
+    $backupDir = Join-Path $kitRoot 'backup'
+    if (-not (Test-Path $backupDir)) { New-Item -ItemType Directory $backupDir | Out-Null }
+    $headFile = Join-Path $backupDir ("mtd0-head-{0}.bin" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    [System.IO.File]::WriteAllBytes($headFile, $head.Bytes)
+    Ok ("原 mtd0 头部已存: $headFile")
 
     # 3) 写保护
     Step '读 mtd0 写保护状态'
@@ -405,28 +460,55 @@ try {
     $r = Invoke-Dev "cd /tmp && wget $httpBase/$target" -TimeoutSec 300
     ($r.Output -split "`n") | Where-Object { $_.Trim() } | ForEach-Object { Note ("  " + $_.Trim()) }
     if ($r.Code -ne 0) { Bad "wget 失败 (exit $($r.Code))"; throw '下载失败' }
-    Ok '下载完成'
 
-    # 7) 校验（PC 比对）
-    Step '校验设备上的文件'
-    if ($caps['wc']) {
-        $r = Invoke-Dev "wc -c < /tmp/$target" -TimeoutSec 30
-        $szM = [regex]::Match($r.Output, '(\d+)')
-        if ($r.Code -ne 0) { Bad "wc 执行失败 (exit $($r.Code))"; throw '长度读取失败' }
-        if (-not $szM.Success) { Bad "wc 输出无法解析: $($r.Output.Trim())"; throw '长度读取失败' }
+    # 7) 校验长度（优先看 wget 自己报的 saved[N]，设备没有 wc 就靠这个）
+    Step '校验设备上的文件长度'
+    $savedM = [regex]::Match($r.Output, 'saved\s*\[(\d+)\]')
+    if ($savedM.Success) {
+        $savedSize = [int64]$savedM.Groups[1].Value
+        if ($savedSize -ne $localSize) { Bad "设备只收到 $savedSize 字节，本地是 $localSize（下载不完整）"; throw '长度校验失败' }
+        Ok "长度一致 ($savedSize 字节，来自 wget)"
+    } elseif ($caps['wc']) {
+        $r2 = Invoke-Dev "wc -c < /tmp/$target" -TimeoutSec 30
+        $szM = [regex]::Match($r2.Output, '(\d+)')
+        if ($r2.Code -ne 0 -or -not $szM.Success) { Bad "取长度失败: $($r2.Output.Trim())"; throw '长度读取失败' }
         $devSize = [int64]$szM.Groups[1].Value
         if ($devSize -ne $localSize) { Bad "长度不一致: 设备 $devSize / 本地 $localSize"; throw '长度校验失败' }
         Ok "长度一致 ($devSize 字节)"
-    } else { Warn '设备没有 wc，跳过长度校验' }
+    } else {
+        Warn '设备既没报 saved[] 也没有 wc，无法校验长度'
+    }
+
+    # 7b) 校验内容：有 md5sum 就比 md5，没有就比前 512 字节
+    Step '校验设备上的文件内容'
+    $headLen = [Math]::Min(512, $localSize)
+    $localHead = New-Object byte[] $headLen
+    $fsLocal = [System.IO.File]::OpenRead($localPath)
+    [void]$fsLocal.Read($localHead, 0, $headLen)
+    $fsLocal.Close()
+    $localHeadHex = (($localHead | ForEach-Object { '{0:x2}' -f $_ }) -join '')
+
     if ($caps['md5sum']) {
-        $r = Invoke-Dev "md5sum /tmp/$target" -TimeoutSec 60
-        if ($r.Code -ne 0) { Bad "md5sum 执行失败 (exit $($r.Code))"; throw 'md5 读取失败' }
-        $md5M = [regex]::Match($r.Output, '([0-9a-fA-F]{32})')
-        if (-not $md5M.Success) { Bad "md5sum 输出无法解析: $($r.Output.Trim())"; throw 'md5 读取失败' }
+        $r3 = Invoke-Dev "md5sum /tmp/$target" -TimeoutSec 60
+        $md5M = [regex]::Match($r3.Output, '([0-9a-fA-F]{32})')
+        if ($r3.Code -ne 0 -or -not $md5M.Success) { Bad "md5sum 失败: $($r3.Output.Trim())"; throw 'md5 读取失败' }
         $devMd5 = $md5M.Groups[1].Value.ToLower()
         if ($devMd5 -ne $localMd5) { Bad "md5 不一致: 设备 $devMd5 / 本地 $localMd5"; throw 'md5 校验失败' }
         Ok "md5 一致 ($devMd5)"
-    } else { Warn '设备没有 md5sum，只校验了长度' }
+    } else {
+        $dh = Invoke-Dev "dd if=/tmp/$target bs=512 count=1 2>/dev/null" -TimeoutSec 60 -Binary
+        if ($dh.Code -ne 0 -or $dh.Bytes.Length -lt $headLen) {
+            Bad "读设备文件头失败（exit=$($dh.Code), $($dh.Bytes.Length) 字节）"; throw '内容校验失败'
+        }
+        $devHeadHex = (($dh.Bytes[0..($headLen - 1)] | ForEach-Object { '{0:x2}' -f $_ }) -join '')
+        if ($devHeadHex -ne $localHeadHex) {
+            Bad "前 $headLen 字节不一致"
+            Note ("设备: " + $devHeadHex.Substring(0, [Math]::Min(64, $devHeadHex.Length)) + '...')
+            Note ("本地: " + $localHeadHex.Substring(0, [Math]::Min(64, $localHeadHex.Length)) + '...')
+            throw '内容校验失败'
+        }
+        Ok "前 $headLen 字节一致（设备没有 md5sum，用逐字节比对）"
+    }
 
     # 8) 解锁（只在必要时）
     if ($needUnlock) {
@@ -452,22 +534,20 @@ try {
     Ok '写入完成'
 
     # 10) 回读比对
-    if ($caps['md5sum'] -and $caps['dd']) {
-        Step '回读前 64 KiB 比对'
-        $rbOut = (Invoke-Dev 'dd if=/dev/mtdblock0 bs=1024 count=64 2>/dev/null | md5sum' -TimeoutSec 120).Output
-        $rbM = [regex]::Match($rbOut, '([0-9a-fA-F]{32})')
-        if ($rbM.Success) {
-            $devRb = $rbM.Groups[1].Value.ToLower()
-            $fs = [System.IO.File]::OpenRead($localPath)
-            $buf = New-Object byte[] 65536
-            $read = $fs.Read($buf, 0, 65536)
-            $fs.Close()
-            $md5 = [System.Security.Cryptography.MD5]::Create()
-            $localRb = ([BitConverter]::ToString($md5.ComputeHash($buf[0..($read - 1)])) -replace '-', '').ToLower()
-            if ($devRb -ne $localRb) { Bad "回读不一致: 设备 $devRb / 本地 $localRb"; throw '回读校验失败' }
-            Ok "回读一致 ($devRb)"
-        } else { Warn '回读没有输出 md5，跳过比对' }
-    } else { Warn '设备缺 dd/md5sum，跳过回读比对' }
+    Step '回读 mtd0 前 512 字节比对'
+    $rb = Invoke-Dev 'dd if=/dev/mtdblock0 bs=512 count=1 2>/dev/null' -TimeoutSec 120 -Binary
+    if ($rb.Code -ne 0 -or $rb.Bytes.Length -lt $headLen) {
+        Warn "回读失败（exit=$($rb.Code), $($rb.Bytes.Length) 字节），无法确认，请自己核对"
+    } else {
+        $rbHex = (($rb.Bytes[0..($headLen - 1)] | ForEach-Object { '{0:x2}' -f $_ }) -join '')
+        if ($rbHex -ne $localHeadHex) {
+            Bad '回读和镜像不一致！'
+            Note ("nand: " + $rbHex.Substring(0, [Math]::Min(64, $rbHex.Length)) + '...')
+            Note ("file: " + $localHeadHex.Substring(0, [Math]::Min(64, $localHeadHex.Length)) + '...')
+            throw '回读校验失败'
+        }
+        Ok "回读一致（前 $headLen 字节）"
+    }
 
     # ------------------------------------------------------------- [4] 重启
     Send-Line $stream 'reboot'
