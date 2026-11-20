@@ -223,6 +223,19 @@ if ($Transport -eq 'tftp') {
     }
 }
 
+function Test-Port {
+    param([string]$IP, [int]$PortNo, [int]$Ms = 1200)
+    $c = New-Object Net.Sockets.TcpClient
+    try {
+        $ok = $c.ConnectAsync($IP, $PortNo).Wait($Ms)
+        return [bool]$ok
+    } catch {
+        return $false
+    } finally {
+        $c.Close()
+    }
+}
+
 function Stop-Servers {
     foreach ($p in $servers) {
         if ($p -and -not $p.HasExited) { try { $p.Kill() } catch { } }
@@ -235,9 +248,50 @@ try {
     # ------------------------------------------------------------- [3] 刷 U-Boot
     Phase 3 $(if ($Check) { '检测设备（不写 NAND）' } else { '刷 U-Boot' })
 
+    Step "检查 $DeviceIp`:23 是否可达"
+    if (-not (Test-Port -IP $DeviceIp -PortNo 23)) {
+        Bad "telnet 端口 $DeviceIp`:23 连不上"
+        Write-Host ''
+
+        # 顺手探一下常见组合，帮着定位是哪种情况
+        $probes = @(
+            @{ ip = $DeviceIp;  port = 80;  hint = '设备在正常启动的原厂固件里（不是 diagnostic mode）' },
+            @{ ip = $DeviceIp;  port = 22;  hint = '设备可能在跑 OpenWrt' },
+            @{ ip = '192.168.0.1'; port = 23; hint = '原厂固件 LAN 默认地址是 192.168.0.1' },
+            @{ ip = '192.168.0.1'; port = 80; hint = '原厂固件 LAN 默认地址是 192.168.0.1' }
+        )
+        $found = $false
+        foreach ($p in $probes) {
+            if (Test-Port -IP $p.ip -PortNo $p.port -Ms 800) {
+                $found = $true
+                Warn ("但是 {0}:{1} 是通的 -> {2}" -f $p.ip, $p.port, $p.hint)
+            }
+        }
+        if (-not $found) {
+            $arp = arp -a 2>$null | Select-String -SimpleMatch $DeviceIp
+            if (-not $arp) {
+                Warn "ARP 表里也没有 $DeviceIp -> 二层没有任何设备应答"
+                Note '这通常意味着：设备没上电 / 网线插在 WAN 口 / 还在启动中 / 没进 diagnostic mode'
+            }
+        }
+
+        Write-Host ''
+        Note '按这个顺序排查：'
+        Note '  1) 设备上电了吗？前面板灯：白灯闪两下 = diagnostic mode，常橙/绿闪 = 正常启动'
+        Note '  2) 网线插在 LAN1-4 吗？（MX64 有 4 个 LAN + 1 个 WAN，插 WAN 口没用）'
+        Note '  3) 进 diag 需要 20~30 秒，刚上电请等灯变绿再试'
+        Note '  4) PC 网卡是 192.168.1.2/24 吗？（脚本第 1 阶段已确认）'
+        Note '  5) 换一根网线 / 换一个 LAN 口试试'
+        Note ''
+        Note '设备正常启动时（非 diag）：LAN 侧是 192.168.0.1，23 端口关闭，只能用 80/22'
+        throw "设备 $DeviceIp 不可达"
+    }
+    Ok 'telnet 端口已打开'
+
     Step "telnet $DeviceIp`:23"
     $client = New-Object System.Net.Sockets.TcpClient
-    $client.Connect($DeviceIp, 23)
+    try { $client.Connect($DeviceIp, 23) }
+    catch { Bad "telnet 连接失败: $($_.Exception.Message)"; throw '设备不可达' }
     $stream = $client.GetStream()
     $stream.ReadTimeout = 1000
     $decoder = [System.Text.Encoding]::UTF8.GetDecoder()
@@ -389,7 +443,7 @@ catch {
     Rule 'DarkRed'
     Note ("日志: $httpLog" + $(if ($logs['tftp']) { "  " + $logs['tftp'] } else { '' }))
     Stop-Servers
-    throw
+    exit 1
 }
 finally {
     Stop-Servers
