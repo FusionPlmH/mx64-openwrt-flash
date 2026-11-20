@@ -885,12 +885,25 @@ try {
 
     # ------------------------------------------------------------- [4] 启动
     if ($BootMedia -eq 'tftp') {
-        # 老路子：让设备自己 reboot，U-Boot 会走 UBI(空) -> USB(没插) -> TFTP 来取 initramfs
-        Send-Line $stream 'reboot'
-        Start-Sleep -Milliseconds 600
-        try { $client.Close() } catch { }
-        Phase 4 '重启并等待 initramfs 起来（TFTP）'
+        # 不 reboot：写完 mtd0 之后 reboot 两台真机都回不来。
+        # 冷启动时 U-Boot 会 UBI(空) -> USB(没插) -> TFTP 自己来取 initramfs。
+        Phase 4 '冷启动：拔电 -> 上电（不插 U 盘，让 U-Boot 自己 TFTP）'
+        Write-Host ''
+        Write-Host '  注意：首次刷完 U-Boot 建议先用默认的 U 盘路径。' -ForegroundColor Yellow
+        Write-Host '        刚写完 mtd0 的那一轮，TFTP 可能因为 NAND 里的旧 u-boot-env' -ForegroundColor Yellow
+        Write-Host '        缺 tftp_boot / enable_tftp_boot 而整步被跳过（见 README 常见问题）。' -ForegroundColor Yellow
+        Write-Host ''
+        Write-Host '  请按这个顺序做：' -ForegroundColor Yellow
+        Write-Host '    1) 拔掉 MX64 的电源，等 3 秒' -ForegroundColor Yellow
+        Write-Host '    2) 不要插 U 盘' -ForegroundColor Yellow
+        Write-Host '    3) 插上电源' -ForegroundColor Yellow
+        Write-Host ''
         Note 'U-Boot 顺序：UBI（空）-> USB（没插）-> TFTP，所以会自己来取镜像'
+        Note "TFTP 服务已在 $tftpBase 跑着，镜像就是 files\ 里的内容"
+        Write-Host ''
+        try { Send-Line $stream 'exit' } catch { }
+        Start-Sleep -Milliseconds 300
+        try { $client.Close() } catch { }
     } else {
         Phase 4 '冷启动：拔电 -> 插 U 盘 -> 上电'
 

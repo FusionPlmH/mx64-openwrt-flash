@@ -1,7 +1,25 @@
 U-Boot 里用 TFTP 升级 bootloader / 引导 initramfs（不用按 reset、不用 U 盘）
 ============================================================================
 
-前提：已经刷上本项目编译的 U-Boot（mx64-ng-2012.10-v2 或更新，带 flash_uboot 命令）。
+什么时候能用 TFTP
+----------------
+  首次（刚从 diagnostic mode 写完 mtd0）必须走 U 盘：插 U 盘冷启动一次，
+  把 initramfs 拉起来。之后这台机器才能靠 TFTP 救砖。
+
+  原因不在硬件，在 U-Boot 自己的三个行为：
+    1) 环境变量从 NAND（0x440000）读，读到的合法环境会整份取代编译内置默认值，
+       不是逐项合并。老版本 u-boot-env 或残留的原厂环境会让 enable_tftp_boot /
+       tftp_boot 这些变量缺失。
+    2) tftp_checkboot 以前写成 `if test $enable_tftp_boot = 1`：变量缺失时 hush
+       把空参数丢掉，test 只剩 2 个参数，do_test() 判定为假 —— 这一步被静默跳过，
+       屏幕上什么都不报。
+    3) tftp_boot 里 setenv netretry no 等价于 retrycnt=0，第一次失败就整轮放弃；
+       而且这块板的驱动不做真实链路检测（bcmiproc_robo.c 直接把端口强制标成 link up），
+       链路没通只会表现为 ARP 超时，不报错。
+
+  v6 起 (2) 改成 `test "x${enable_tftp_boot}" != "x0"`，变量缺失也是启用。
+
+前提：已经刷上本项目编译的 U-Boot（mx64-ng-2012.10-v5 或更新，带 flash_uboot 命令）。
       PC 网卡与设备同网段（下面按惯例用 192.168.1.2/24），TFTP 服务器跑在 PC 的 IP:69
       （kit 里：python scripts\70-tftp-server.py；Windows 不需要管理员，Linux 需要 root）。
 
@@ -107,6 +125,16 @@ U-Boot 里用 TFTP 升级 bootloader / 引导 initramfs（不用按 reset、不�
 
 
 7) 常用排错
+
+   TFTP 完全没反应
+                    -> 先在 U-Boot 提示符敲 printenv，看 enable_tftp_boot / tftp_boot
+                       在不在。缺变量说明 NAND 里的 u-boot-env 比二进制老：
+                         setenv enable_tftp_boot 1
+                         saveenv                       （不碰 mtd0，没有变砖风险）
+                       或者用 tools/mkenv.py 重新生成 uboot-env.bin 写到 mtd3。
+                     -> 再看 ping 192.168.1.2 通不通（ARP 通不通）：
+                         ping 不通 -> 交换机/GMAC 这一侧，网线、PC 防火墙、gmac 变量
+                         ping 通但 tftpboot 失败 -> PC 上的服务端/文件名/块大小
 
    ping 不通          -> 网线是不是插在 LAN 口、PC 防火墙、ipaddr/serverip 是不是对
    TFTP timeout       -> PC 上 TFTP 服务器没起，或 UDP 69 被别的进程占用 / 被防火墙拦

@@ -60,8 +60,10 @@ ubinfo -a                     # 有 rootfs_data 卷 => 已装好
 |---|---|
 | 第一次装 U-Boot 要按 reset 吗？ | **要**。原厂固件只有 diagnostic mode 给 shell |
 | 之后刷 initramfs 还要按 reset 吗？ | **不用**（用本项目的 U-Boot）。引导顺序 UBI → USB → TFTP，前一个失败自动试下一个 |
+| 首次刷完 U-Boot 能用 TFTP 起 initramfs 吗？ | **不行，首次必须 U 盘**。刚写完 mtd0 的第一轮启动只能靠 USB，之后这台机器才能用 TFTP 救砖（原因见下） |
 | 刷机脚本怎么把系统弄起来？ | **U 盘冷启动**：写完后拔电 → 插 U 盘（放一个 initramfs）→ 上电。U 盘要你自备，脚本不写盘 |
 | 为什么不直接 `reboot`？ | 两台真机实测，写完 mtd0 发 `reboot` 设备都回不来（常亮橙、网络全死），只有拔电冷启动进得去 U-Boot |
+| 为什么首次 TFTP 完全不动？ | 三个原因叠加：① NAND 里的 `u-boot-env` 若是老版本，合法环境会**整份取代**编译默认值，`tftp_boot` / `enable_tftp_boot` 可能根本不存在；② `tftp_checkboot` 旧写法 `if test $enable_tftp_boot = 1` 在变量为空时被 hush 判成假，这一步**静默跳过**；③ `tftp_boot` 的 `netretry no` 等价于零重试，而这板的驱动不做真实链路检测（端口被强制标成 link up），链路没通只表现为 ARP 超时。源码 v6 已修 ②（`files/uboot_ng.bin` 还是 v5）；现在想绕开就先 `setenv enable_tftp_boot 1; saveenv` |
 | U 盘上放 sysupgrade 能自动装吗？ | **不能**。U-Boot 的 USB 路径只 `fatload` + `bootm`，从不写 NAND；而且只认两个固定文件名，也只认 FIT/uImage/SPIM 三种 magic |
 | 备份原厂分区吗？ | **默认跳过**（见「备份」一节，要备份需手动做） |
 | 一条命令能刷完吗？ | 能：`scripts\00-flash.ps1` 一路到 sysupgrade |
@@ -211,6 +213,11 @@ dd if=/dev/mtd0 bs=65536 skip=0 count=1 2>/dev/null   # 整镜像回读：skip=0
 等 192.168.1.1:22 打开，最长 900 秒
 ```
 
+带 `-BootMedia tftp` 时同样**不 reboot**，只是不必插 U 盘：U-Boot 冷启动先试 UBI、
+再试 USB（没盘），最后自己 TFTP 拉 initramfs。这条路只适合**已经刷过本项目 U-Boot**
+的机器救砖；刚写完 mtd0 的第一次启动请用默认的 U 盘路径（原因见「常见问题」里
+「为什么首次 TFTP 完全不动？」）。
+
 **为什么不发 `reboot`**：两台真机都是写完 mtd0 → `reboot` → 设备再也不回来（常亮橙、无网络），
 而拔电源冷启动 + 插 U 盘一次就成功（约 77 秒起 initramfs）。所以脚本只管告诉你什么时候拔电。
 
@@ -223,7 +230,7 @@ dd if=/dev/mtd0 bs=65536 skip=0 count=1 2>/dev/null   # 整镜像回读：skip=0
 | `-DryRun` | 只打印计划 |
 | `-SkipSysupgrade` | 刷完 U-Boot、进了 initramfs 就停 |
 | `-Uboot clayface` | 改刷 clayface 的 `uboot_mx64`（默认 `uboot_ng.bin`） |
-| `-BootMedia tftp` | 改成让 U-Boot 自己 TFTP 取 initramfs（默认 `usb`，只给指示不写盘） |
+| `-BootMedia tftp` | 改成让 U-Boot 自己 TFTP 取 initramfs（默认 `usb`，只给指示不写盘）。**首次刷完 U-Boot 不要用**，留给之后的救砖 |
 | `-BootTimeoutSec <秒>` | 第 4 阶段等 22 端口多久，默认 **900** |
 | `-Transport http` | diag 下载方式，默认就是 http（`tftp` 无效：设备没有 tftp 客户端） |
 | `-SysupgradeFile <路径>` | 指定 sysupgrade 镜像（默认按 A0/B0+ 自动挑最新的） |
@@ -421,6 +428,7 @@ wget http://192.168.1.2:8000/60-reclaim-space.sh && sh 60-reclaim-space.sh
 | 现象 | 处理 |
 |---|---|
 | `192.168.1.1:23` 连不上 | 设备没进 diag（正常启动时 LAN 是 `192.168.0.1`）；网线要插 LAN1-4 不是 WAN；进 diag 要 20~30 秒 |
+| 首次冷启动后 U 盘能起、TFTP 一句话都不报 | 大概率是 `tftp_checkboot` 被静默跳过（老 `u-boot-env` 里没有 `enable_tftp_boot`，或旧写法 `test $var = 1` 退化成两个参数）。先 `printenv enable_tftp_boot`，再 `setenv enable_tftp_boot 1; saveenv`。详见 [90-uboot-tftp.txt](scripts/90-uboot-tftp.txt) 开头 |
 | 白灯闪两下后一直橙 | diag Linux 没起来；断电重试 2-3 次；仍不行请接串口（J1，115200 8N1） |
 | `wget` 404 | HTTP 服务目录不对，或文件名打错 |
 | `wget: can't open 'xxx': File exists` | 原厂 busybox 的 `wget` **不覆盖**已有文件。脚本已自动 `rm -f` 后重下；手敲命令时自己先删 |
@@ -545,7 +553,8 @@ shell 条件判断的地方都栽过，最后关键逻辑都被挪进了 C。
 | v2 | 初始可刷版本 | `soc_dtscheck` 用 `if test $? = 1`，而 hush 拿不到命令返回值 → 永远选 `config@2`(A0) |
 | v3 | 改成 `getsocrev set`，由命令自己 `setenv` | `if test -z "${config_dts}"` 在变量为空时退化成 `test -z`（只剩 2 个参数），而 `cmd_test.c` 里 `if (argc < 3) return 1;` 返回假 → `then` 分支永不执行 |
 | v4 | `soc_dtscheck=getsocrev set` 无条件调用，判断挪进 C | `ipaddr` 编译默认值 `192.168.0.1` 和 `serverip 192.168.1.2` 跨网段 → U-Boot 不 ACK OACK，TFTP 死在 `block 1/11779` |
-| **v5** | 网络三件套同网段（`192.168.1.10` / `192.168.1.2` / `255.255.255.0`），并去掉 `tftp_boot` 里的 `test -z` 判断 | 当前版本 |
+| v5 | 网络三件套同网段（`192.168.1.10` / `192.168.1.2` / `255.255.255.0`），并去掉 `tftp_boot` 里的 `test -z` 判断 | **`files/uboot_ng.bin` 就是这一版**。`*_checkboot` 仍是 `if test $enable_xxx = 1`，变量缺失时静默跳过 |
+| **v6**（仅源码） | `*_checkboot` / `pick_tftp_files` 改成 `test "x${var}" != "x0"`，变量为空不再吞掉参数；被禁用时打印一行原因 | 需要自己编译并刷 mtd0；`files/uboot_ng.bin` 还没换成 v6 |
 
 **通用教训**：U-Boot 的 shell 条件判断不可靠 —— `$?` 拿不到返回值，`test` 在参数不足时
 静默返回假。任何"变量为空就做某事"的判断都不要写在 env 脚本里。
