@@ -61,7 +61,9 @@ ubinfo -a                     # 有 rootfs_data 卷 => 已装好
 | 第一次装 U-Boot 要按 reset 吗？ | **要**。原厂固件只有 diagnostic mode 给 shell |
 | 之后刷 initramfs 还要按 reset 吗？ | **不用**（用本项目的 U-Boot）。引导顺序 UBI → USB → TFTP，前一个失败自动试下一个 |
 | 首次刷完 U-Boot 能用 TFTP 起 initramfs 吗？ | **v6 起可以**：写 mtd0 不碰 env 分区，而 v6 启动时会先把 NAND 环境里缺的默认变量补齐，所以即使是原厂 env 也能走完 UBI → USB → TFTP。前提是 PC 上 TFTP 在跑、网线/防火墙没问题。首次仍建议先用 U 盘起一次确认链路，再放心用 TFTP |
-| 刷机脚本怎么把系统弄起来？ | **U 盘冷启动**：写完后拔电 → 插 U 盘（放一个 initramfs）→ 上电。U 盘要你自备，脚本不写盘 |
+| 刷机脚本怎么把系统弄起来？ | **U 盘 + TFTP 双通道**：脚本默认同时起 HTTP 和 TFTP，插着 U 盘走 USB、没插就走网络，U-Boot 自己按 UBI → USB → TFTP 试。22 端口一通立即关掉这两个服务，并打印 `Boot via` 告诉你是哪条路 |
+| 怎么知道这次是 USB 还是 TFTP 进来的？ | 看最后的 `Boot via`：`TFTP（<文件名>）` = 网络传的；`USB 或 UBI（TFTP 无传输记录）` = TFTP 一条请求都没收到。TFTP 日志里出现 `<文件名> done` 才算传完 |
+| 可以不用拔电吗？ | **不行**。两台真机实测：写完 mtd0 发 `reboot` 设备都不回来（常亮橙、网络全死），只有掉电才复位得干净。想试软重启加 `-WarmReboot`，脚本会等 90 秒再提醒你拔电 |
 | 为什么不直接 `reboot`？ | 两台真机实测，写完 mtd0 发 `reboot` 设备都回不来（常亮橙、网络全死），只有拔电冷启动进得去 U-Boot |
 | 为什么首次 TFTP 完全不动？ | 三个原因叠加：① 写 mtd0 不动 env 分区，原厂 env 会**整份取代**编译默认值，`tftp_boot` / `enable_tftp_boot` 可能根本不存在；② `tftp_checkboot` 旧写法 `if test $enable_tftp_boot = 1` 在变量为空时被 hush 判成假，这一步**静默跳过**；③ `tftp_boot` 的 `netretry no` 等价于零重试，而这板的驱动不做真实链路检测（端口被强制标成 link up），链路没通只表现为 ARP 超时。v6 同时修了 ①②：启动时补齐缺失的默认变量，`test` 也改成 `x${var}` 前缀比较 |
 | U 盘上放 sysupgrade 能自动装吗？ | **不能**。U-Boot 的 USB 路径只 `fatload` + `bootm`，从不写 NAND；而且只认两个固定文件名，也只认 FIT/uImage/SPIM 三种 magic |
@@ -115,7 +117,7 @@ cd mx64-openwrt-flash      # git clone 默认目录名；也可以 cd 到你放 
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -DryRun     # 看计划
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Check      # 只读设备、出结论
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Probe      # 只验证 mtd 工具，不擦不写
-powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1             # 真刷（默认 HTTP 下载 + U 盘冷启动）
+powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1             # 真刷（HTTP 下载 + U 盘/TFTP 双通道冷启动）
 ```
 
 网络参数都可以改；`-ServerIp` 不写时会自动选本机 `192.168.1.x` 地址（优先 `192.168.1.2`）：
@@ -145,9 +147,11 @@ powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -ServerIp 192.168.
   `90-uboot-tftp.txt` 里的 `ethaddr`（换成新机器标签上的 MAC）和 `serverip`（PC 地址）。
 - **不要一起分发**：`backup/`、`mx64-backup/`（本机的设备备份），已在 `.gitignore` 里忽略。
 
-第 2 阶段**只起一种服务**：diag 模式下设备要靠 `wget` 把镜像拉进去，所以 HTTP 一定起；
-TFTP 只在 `-BootMedia tftp` 时起（那种模式下 U-Boot 会自己来取 initramfs）。
-默认的 U 盘流程根本不需要 TFTP。
+第 2 阶段**同时起 HTTP 和 TFTP**：diag 模式下设备要靠 `wget` 把镜像拉进去（走 HTTP）；
+TFTP 是给冷启动后的 U-Boot 准备的，和 U 盘并行存在——**插不插 U 盘都能起**，
+不用事先选。U-Boot 的顺序是 UBI → USB → TFTP，谁先成功就用谁。
+
+想彻底不起 TFTP（比如 UDP 69 被占用）用 `-NoTftp`，那就只剩 U 盘一条路。
 
 > diag 的 busybox 只有一个 `wget`，**没有 tftp 客户端**，所以 `-Transport tftp` 无效，下载一律走 HTTP。
 
@@ -162,7 +166,7 @@ TFTP 只在 `-BootMedia tftp` 时起（那种模式下 U-Boot 会自己来取 in
 | ssh / scp 存在 | 第 6 阶段要用；没有就自动跳过 sysupgrade |
 | 是否管理员 | Windows 绑 UDP 69 **不需要**管理员，只是提示 |
 | 网卡防火墙配置 | 若是「公用网络」会警告 —— 设备的入站请求可能被拦 |
-| **端口是否被占用** | 只查本轮真用到的：`TCP 8000`（HTTP）；`-BootMedia tftp` 时再加 `UDP 69`。上一轮没退干净的 python 服务会让第 2 阶段直接失败 |
+| **端口是否被占用** | `TCP 8000`（HTTP）和 `UDP 69`（TFTP，默认就起；`-NoTftp` 才跳过）。上一轮没退干净的 python 服务会让第 2 阶段直接失败 |
 | **`files/` 里所有镜像的完整性** | 优先按 `SHA256SUMS` 逐个比对（覆盖 12 个文件）；没有 `SHA256SUMS` 才退回 `*.sha256` / `*.sha512` sidecar。防止刷进旧版本或下坏的镜像 |
 | **U-Boot 版本 tag** | 从 `uboot_ng.bin` 里抓 `mx64-ng-*`，一眼确认刷的是哪个构建 |
 | `%TEMP%` 所在盘剩余空间 | 暂存要 ~35 MB |
@@ -185,10 +189,10 @@ TFTP 只在 `-BootMedia tftp` 时起（那种模式下 U-Boot 会自己来取 in
 | 阶段 | 干什么 |
 |---|---|
 | [1] 环境检查 | 见上表 |
-| [2] 起服务 | 只起 HTTP（`-Transport` 那一种），给 diag 下载用 |
+| [2] 起服务 | 同时起 HTTP（给 diag 下载）和 TFTP（给冷启动后的 U-Boot），两条路并行 |
 | [3] 刷 U-Boot | telnet 进设备，逐条发命令：能力探测 → 读 `mtd0`/写保护/SoC → 决定刷哪个 → 设备 `wget` 下载 → PC 比对长度和 md5 → （按需）`insmod mtd-rw.ko` 解锁 → `dd` 或 `mtd write` → **整份镜像回读逐字节比对** |
-| [4] 冷启动 | **不发 `reboot`**。打印 U 盘要求，让你拔电 → 插 U 盘 → 上电，然后等 22 端口（默认 900 秒） |
-| [5] 关服务 | 停掉 HTTP（系统已在 RAM 里跑） |
+| [4] 冷启动 | **不发 `reboot`**。打印步骤：拔电 → （可选）插 U 盘 → 上电；然后等 22 端口（默认 900 秒） |
+| [5] 关服务 | **22 端口一通就立刻停掉 HTTP + TFTP**，并按 TFTP 日志判断这次走的是哪条路 |
 | [6] sysupgrade | `scp` 上传 → `ssh sysupgrade -n` → 等系统重启回来 |
 
 第 3 阶段设备上实际执行的命令（就是这么几条，逻辑都在 PC）：
@@ -206,20 +210,25 @@ cd /tmp && ./mtd write /tmp/uboot_ng.bin /dev/mtd0    # 或 dd if=/tmp/uboot_ng.
 dd if=/dev/mtd0 bs=65536 skip=0 count=1 2>/dev/null   # 整镜像回读：skip=0..9，共 10 块
 ```
 
-第 4 阶段不带 `-BootMedia tftp` 时，脚本做的事只有：
+第 4 阶段脚本做的事：
 
 ```
-打印 U 盘要求（分区 1 / FAT16|FAT32 / 根目录 / 文件名一字不差）
+打印步骤（拔电 -> 可选插 U 盘 -> 上电）和 U 盘要求（分区 1 / FAT16|FAT32 / 根目录 / 文件名一字不差）
 等 192.168.1.1:22 打开，最长 900 秒
+过程中实时读 TFTP 日志：有请求就打印 "U-Boot 来取文件了: <文件>"，传完打印 "TFTP 传输完成: <文件>"
+22 端口一通 -> 立刻停掉 HTTP 和 TFTP -> 打印 Boot via（这次到底走的哪条路）
 ```
 
-带 `-BootMedia tftp` 时同样**不 reboot**，只是不必插 U 盘：U-Boot 冷启动先试 UBI、
-再试 USB（没盘），最后自己 TFTP 拉 initramfs。这条路只适合**已经刷过本项目 U-Boot**
-的机器救砖；刚写完 mtd0 的第一次启动请用默认的 U 盘路径（原因见「常见问题」里
-「为什么首次 TFTP 完全不动？」）。
+**判断走的是 USB 还是 TFTP**：只看 TFTP 日志里有没有 `xxx done`。
+
+| `Boot via` | 含义 |
+|---|---|
+| `TFTP（openwrt-...initramfs.bin）` | U-Boot 从网络取的镜像，U 盘没参与 |
+| `USB 或 UBI（TFTP 无传输记录）` | TFTP 一条请求都没收到 → 走的 U 盘，或 NAND 里已装的系统 |
 
 **为什么不发 `reboot`**：两台真机都是写完 mtd0 → `reboot` → 设备再也不回来（常亮橙、无网络），
-而拔电源冷启动 + 插 U 盘一次就成功（约 77 秒起 initramfs）。所以脚本只管告诉你什么时候拔电。
+而拔电源冷启动一次就成功（约 77 秒起 initramfs）。所以脚本只管告诉你什么时候拔电。
+想试软重启可以加 `-WarmReboot`：脚本会发 `reboot` 并继续等，90 秒还没起来就提示你拔电。
 
 ### 开关
 
@@ -230,7 +239,10 @@ dd if=/dev/mtd0 bs=65536 skip=0 count=1 2>/dev/null   # 整镜像回读：skip=0
 | `-DryRun` | 只打印计划 |
 | `-SkipSysupgrade` | 刷完 U-Boot、进了 initramfs 就停 |
 | `-Uboot clayface` | 改刷 clayface 的 `uboot_mx64`（默认 `uboot_ng.bin`） |
-| `-BootMedia tftp` | 改成让 U-Boot 自己 TFTP 取 initramfs（默认 `usb`，只给指示不写盘）。**首次刷完 U-Boot 不要用**，留给之后的救砖 |
+| `-BootMedia both` | **默认**：HTTP + TFTP 都起，插不插 U 盘都能起 |
+| `-BootMedia tftp` | 同上，但提示里不提 U 盘（纯网络路径） |
+| `-NoTftp` | 不起 TFTP，只留 U 盘一条路（UDP 69 被占用时用） |
+| `-WarmReboot` | 先试软重启（实测多数起不来），失败再提醒拔电 |
 | `-BootTimeoutSec <秒>` | 第 4 阶段等 22 端口多久，默认 **900** |
 | `-Transport http` | diag 下载方式，默认就是 http（`tftp` 无效：设备没有 tftp 客户端） |
 | `-SysupgradeFile <路径>` | 指定 sysupgrade 镜像（默认按 A0/B0+ 自动挑最新的） |
@@ -256,6 +268,18 @@ dd if=/dev/mtd0 bs=65536 skip=0 count=1 2>/dev/null   # 整镜像回读：skip=0
    [ ok ] 写入完成
           1/10 块一致 ... 10/10 块一致
    [ ok ] 回读一致（整份 598,488 字节，10 块逐字节比对）
+
+[4/6] 冷启动：拔电 -> (可选)插 U 盘 -> 上电（U 盘 / TFTP 双通道）
+--------------------------------------------------------------------
+   ...（按提示拔电上电）
+   [ ok ] U-Boot 来取文件了: openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin -> 192.168.1.10 (...)
+   [ ok ] TFTP 传输完成: openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin
+   [ ok ] initramfs 已启动（ssh 端口打开）
+
+[5/6] 关闭传输服务
+--------------------------------------------------------------------
+   [ ok ] 传输服务已停止（HTTP + TFTP）
+   Boot via   : TFTP（openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin）
 ```
 
 ## 手动命令（自动流程不适用时的兜底）
@@ -311,9 +335,10 @@ sync
 
 `00-flash.ps1` 会自动做这三件事并给出结论（`-Check` 只看不写）。
 
-### 1. 准备 U 盘（`-BootMedia usb`，默认路径）
+### 1. 准备 U 盘（可选，`-BootMedia both` 默认；纯 TFTP 可不插）
 
-写 mtd0 之后靠它把这台机器重新拉起来。**脚本不写盘**，你手动拷一个文件就行：
+写 mtd0 之后它是**最快**的一条路（U-Boot 先试 USB 再试 TFTP），但**不是必须的**：
+PC 上 TFTP 服务在跑的话，不插 U 盘也能起。**脚本不写盘**，你手动拷一个文件就行：
 
 - 单个分区，**FAT16 或 FAT32**（MBR 分区表）
 - 文件放在**分区根目录**，不要放子目录
@@ -437,6 +462,8 @@ wget http://192.168.1.2:8000/60-reclaim-space.sh && sh 60-reclaim-space.sh
 | 解锁后 `/sys/block/mtdblock0/ro` 还是 1 | **正常，别管它**。那是块设备的静态属性，`mtd-rw` 改的是 `mtd->flags`，sysfs 不会跟着变。判据应该是 `/proc/modules` 里有 `mtd_rw`，或 dmesg 有 `mtd-rw: mtd0: setting writeable flag` |
 | `mtd: Could not open mtd device: mtd0` | 这个 `mtd` 只认 **`/dev/mtd0` 全路径**，传 `mtd0` 或 label `boot` 都不行 |
 | 回读和镜像不一致 | 不要断电重启 —— 那段就是起不来的原因。直接重跑脚本再写一次 |
+| `Boot via: USB 或 UBI（TFTP 无传输记录）` 但你没插 U 盘 | 说明 NAND 里已经有能启动的系统（UBI 引导成功），TFTP 根本没被用到。想确认换 U-Boot 生效没有，用 `mx64info` 看 `Tag` |
+| TFTP 日志有 `-> 192.168.1.10` 但没有 `done` | 传输中断：查防火墙/丢包/网线；脚本会显示 `TFTP（传输未确认）`。重试即可，NAND 没被动过 |
 | 写完 mtd0，设备不回来了（常亮橙、无网络） | 别用 `reboot`，拔电源冷启动 + 插 U 盘。两台真机都是这个规律 |
 | 插了 U 盘但白灯一次都不闪 | U-Boot 没走到 `usb_boot`。检查 U 盘是 FAT16/FAT32 单分区、文件名一字不差；换个 U 盘再试；仍不行接串口 J1（115200 8N1） |
 | 白灯闪三下后又回到常亮橙 | `fatload` 成功了但 `bootm` 失败 —— 文件名对但内容不对（比如放成了 sysupgrade） |
