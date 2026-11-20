@@ -67,6 +67,13 @@ def build(entries, overrides):
 def main():
     if len(sys.argv) < 3:
         raise SystemExit(__doc__)
+
+    # 输出里带中文；Windows 控制台默认 cp1252 时 print 会抛 UnicodeEncodeError
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except AttributeError:
+        pass
+
     src, dst = sys.argv[1], sys.argv[2]
     overrides = sys.argv[3:]
 

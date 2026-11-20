@@ -45,7 +45,7 @@ ubinfo -a                     # 有 rootfs_data 卷 => 已装好
 
 | 选项 | 刷什么 | 大小 | 说明 |
 |---|---|---|---|
-| **默认** | `uboot_ng.bin`（本项目编） | 598,172 B，需 1 MiB 分区 | 带 `bootimg` / `flash_uboot` / TFTP 自动引导 |
+| **默认** | `uboot_ng.bin`（本项目编） | 598,440 B，需 1 MiB 分区 | 带 `bootimg` / `flash_uboot` / TFTP 自动引导 |
 | `-Uboot clayface` | `uboot_mx64` / `uboot_mx64_small` | 587,312 / 524,288 B | wiki 上大量机器验证过的版本 |
 
 两个自动保护：
@@ -63,7 +63,7 @@ ubinfo -a                     # 有 rootfs_data 卷 => 已装好
 | 首次刷完 U-Boot 能用 TFTP 起 initramfs 吗？ | **不行，首次必须 U 盘**。刚写完 mtd0 的第一轮启动只能靠 USB，之后这台机器才能用 TFTP 救砖（原因见下） |
 | 刷机脚本怎么把系统弄起来？ | **U 盘冷启动**：写完后拔电 → 插 U 盘（放一个 initramfs）→ 上电。U 盘要你自备，脚本不写盘 |
 | 为什么不直接 `reboot`？ | 两台真机实测，写完 mtd0 发 `reboot` 设备都回不来（常亮橙、网络全死），只有拔电冷启动进得去 U-Boot |
-| 为什么首次 TFTP 完全不动？ | 三个原因叠加：① NAND 里的 `u-boot-env` 若是老版本，合法环境会**整份取代**编译默认值，`tftp_boot` / `enable_tftp_boot` 可能根本不存在；② `tftp_checkboot` 旧写法 `if test $enable_tftp_boot = 1` 在变量为空时被 hush 判成假，这一步**静默跳过**；③ `tftp_boot` 的 `netretry no` 等价于零重试，而这板的驱动不做真实链路检测（端口被强制标成 link up），链路没通只表现为 ARP 超时。源码 v6 已修 ②（`files/uboot_ng.bin` 还是 v5）；现在想绕开就先 `setenv enable_tftp_boot 1; saveenv` |
+| 为什么首次 TFTP 完全不动？ | 三个原因叠加：① NAND 里的 `u-boot-env` 若是老版本，合法环境会**整份取代**编译默认值，`tftp_boot` / `enable_tftp_boot` 可能根本不存在；② `tftp_checkboot` 旧写法 `if test $enable_tftp_boot = 1` 在变量为空时被 hush 判成假，这一步**静默跳过**；③ `tftp_boot` 的 `netretry no` 等价于零重试，而这板的驱动不做真实链路检测（端口被强制标成 link up），链路没通只表现为 ARP 超时。②已在 v6 修掉（`files/uboot_ng.bin` 就是 v6）；①靠重写 mtd3 的 `u-boot-env` 解决 |
 | U 盘上放 sysupgrade 能自动装吗？ | **不能**。U-Boot 的 USB 路径只 `fatload` + `bootm`，从不写 NAND；而且只认两个固定文件名，也只认 FIT/uImage/SPIM 三种 magic |
 | 备份原厂分区吗？ | **默认跳过**（见「备份」一节，要备份需手动做） |
 | 一条命令能刷完吗？ | 能：`scripts\00-flash.ps1` 一路到 sysupgrade |
@@ -74,7 +74,7 @@ ubinfo -a                     # 有 rootfs_data 卷 => 已装好
 README.md                    本文件
 SHA256SUMS                   files/ 下所有文件的校验值（00-flash.ps1 第 1 阶段会逐个核对）
 files/
-  uboot_ng.bin               本项目的 U-Boot v5（598,268 B，需 1 MiB 分区）
+  uboot_ng.bin               本项目的 U-Boot v6（598,440 B，需 1 MiB 分区）
   uboot-env.bin              U-Boot 环境变量块（含 config_dts=config@4，给老版本兜底）
   uboot_mx64                 1 MiB boot 分区用的 clayface U-Boot（587,312 B）
   uboot_mx64_small           512 KiB boot 分区用的 clayface U-Boot（524,288 B）
@@ -248,14 +248,14 @@ dd if=/dev/mtd0 bs=65536 skip=0 count=1 2>/dev/null   # 整镜像回读：skip=0
    [ ok ] mtd0 = 0x00100000 (1048576 字节)
    [ !  ] mtd0 有写保护（ro=1）-> 需要 mtd-rw.ko 解锁
    [ ok ] 0x18000000 = 0x3F040000 -> B0+（用常规镜像）
-   [ ok ] 将刷入 uboot_ng.bin (598172 字节, md5 648a8d98...)
+   [ ok ] 将刷入 uboot_ng.bin (598440 字节, md5 6b1eecd0...)
    [ ok ] 下载完成
-   [ ok ] 长度一致 (598172 字节)
+   [ ok ] 长度一致 (598440 字节)
    [ ok ] md5 一致 (648a8d98...)
    [ ok ] mtd0 已解锁（ro=0）
    [ ok ] 写入完成
           1/10 块一致 ... 10/10 块一致
-   [ ok ] 回读一致（整份 598268 字节，10 块逐字节比对）
+   [ ok ] 回读一致（整份 598440 字节，10 块逐字节比对）
 ```
 
 ## 手动命令（自动流程不适用时的兜底）
@@ -276,7 +276,7 @@ devmem 0x18000000
 cd /tmp
 rm -f uboot_ng.bin                 # 原厂 wget 不覆盖已有文件！
 wget http://192.168.1.2:8000/uboot_ng.bin
-ls -l uboot_ng.bin                 # 应该是 598172 字节（没有 wc 时用这个）
+ls -l uboot_ng.bin                 # 应该是 598440 字节（没有 wc 时用这个）
 
 # 只有 ro=1 才需要解锁
 rm -f mtd-rw.ko mtd
@@ -472,7 +472,7 @@ dd if=/dev/mtd3 bs=4096 count=64 | md5sum    # 和本地比对
 # 断电（不要 reboot）：拔电源 -> 插 U 盘（initramfs）-> 上电
 ```
 
-`files/uboot-env.bin` 就是这份（crc `0x7b2ae92f`，md5 `7e35ca65061087b233b093161e94ce05`），
+`files/uboot-env.bin` 就是这份（crc `0xaf3245d9`，md5 `a05f011f4ebd9383b2bc7fd995b18621`），
 可以直接用。注意 `mtd` 工具只认 **label**（`u-boot-env`），传 `mtd3` 会报
 `Could not open mtd device`。
 
@@ -554,7 +554,7 @@ shell 条件判断的地方都栽过，最后关键逻辑都被挪进了 C。
 | v3 | 改成 `getsocrev set`，由命令自己 `setenv` | `if test -z "${config_dts}"` 在变量为空时退化成 `test -z`（只剩 2 个参数），而 `cmd_test.c` 里 `if (argc < 3) return 1;` 返回假 → `then` 分支永不执行 |
 | v4 | `soc_dtscheck=getsocrev set` 无条件调用，判断挪进 C | `ipaddr` 编译默认值 `192.168.0.1` 和 `serverip 192.168.1.2` 跨网段 → U-Boot 不 ACK OACK，TFTP 死在 `block 1/11779` |
 | v5 | 网络三件套同网段（`192.168.1.10` / `192.168.1.2` / `255.255.255.0`），并去掉 `tftp_boot` 里的 `test -z` 判断 | **`files/uboot_ng.bin` 就是这一版**。`*_checkboot` 仍是 `if test $enable_xxx = 1`，变量缺失时静默跳过 |
-| **v6**（仅源码） | `*_checkboot` / `pick_tftp_files` 改成 `test "x${var}" != "x0"`，变量为空不再吞掉参数；被禁用时打印一行原因 | 需要自己编译并刷 mtd0；`files/uboot_ng.bin` 还没换成 v6 |
+| **v6** | `*_checkboot` / `pick_tftp_files` 改成 `test "x${var}" != "x0"`，变量为空不再吞掉参数；被禁用时打印一行原因 | 当前版本（598,440 B）。`files/uboot-env.bin` 已按 v6 重新生成 |
 
 **通用教训**：U-Boot 的 shell 条件判断不可靠 —— `$?` 拿不到返回值，`test` 在参数不足时
 静默返回假。任何"变量为空就做某事"的判断都不要写在 env 脚本里。
