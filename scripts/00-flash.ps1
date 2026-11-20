@@ -1,7 +1,7 @@
 ﻿# =============================================================================
 #  MX64 一键刷机（全部逻辑在 PC 侧）
 #
-#    powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1              # 默认 TFTP，刷 uboot_ng
+#    powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1              # 默认：HTTP 下载 + U 盘冷启动
 #    powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Check      # 只看结论
 #    powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -DryRun     # 只看计划
 #
@@ -10,28 +10,33 @@
 #
 #  流程（6 个阶段）：
 #    [1] 环境检查    网卡 / python / ssh+scp / 暂存文件
-#    [2] 起服务      TFTP(UDP 69) + HTTP(备用)
-#    [3] 刷 U-Boot   探测能力 -> 读分区/写保护/SoC -> 下载 -> 校验 -> 写入 -> 回读
-#    [4] 重启等系统  设备重启 -> U-Boot 自动 TFTP 拉 initramfs
-#    [5] 关服务      不再需要 TFTP/HTTP
+#    [2] 起服务      只起 -Transport 那一种（默认 HTTP），给 diag 下载用
+#    [3] 刷 U-Boot   探测能力 -> 读分区/写保护/SoC -> 下载 -> 校验 -> 写入 -> 整镜像回读
+#    [4] 冷启动      提示拔电 -> 插 U 盘 -> 上电，然后等设备自己起来
+#    [5] 关服务      HTTP 已经没用了
 #    [6] sysupgrade  scp 上传 + ssh 执行，等系统回来
 #
+#  第 4 阶段为什么是拔电、而不是 reboot：
+#    两台真机实测，写 mtd0 之后发 `reboot`，设备都回不来（常亮橙、网络全死），
+#    而拔电源冷启动 + 插 U 盘一次就成功（约 77 秒起 initramfs）。
+#    所以脚本不再负责重启，只负责在正确时刻让你拔电。
+#
 #  前提：设备已在 diagnostic mode；PC 网卡 192.168.1.2/24。
-#  -Transport 只选 diag 里设备怎么下载；TFTP 永远会起（U-Boot 只会 TFTP），
-#  所以 PowerShell 要用管理员启动，否则刷完重启拉不到 initramfs。
 # =============================================================================
 
 param(
     [string]$ServerIp = '192.168.1.2',
     [string]$DeviceIp = '192.168.1.1',
     [int]$Port = 8000,
-    [ValidateSet('tftp', 'http')]
-    [string]$Transport = 'tftp',
+    [ValidateSet('http', 'tftp')]
+    [string]$Transport = 'http',
+    [ValidateSet('usb', 'tftp')]
+    [string]$BootMedia = 'usb',
     [ValidateSet('ng', 'clayface')]
     [string]$Uboot = 'ng',
     [string]$SysupgradeFile = '',
-    [int]$BootTimeoutSec = 300,
-    [int]$HintSec = 45,
+    [int]$BootTimeoutSec = 900,
+    [int]$HintSec = 120,
     [int]$SshTimeoutSec = 240,
     [switch]$Check,
     [switch]$SkipSysupgrade,
@@ -145,13 +150,12 @@ Banner
 
 $httpBase = "http://${ServerIp}:$Port"
 $tftpBase = "tftp://$ServerIp"
-if ($Transport -eq 'tftp') { $primary = $tftpBase; $fallback = $httpBase }
-else { $primary = $httpBase; $fallback = $tftpBase }
 
 Write-Host ''
 Write-Host '  这次的配置' -ForegroundColor White
 KeyVal 'Device'     "$DeviceIp (telnet 23)"
-KeyVal 'Server'     "$ServerIp  (diag 用 $Transport 下载 / U-Boot 一律走 tftp)"
+KeyVal 'Server'     "$ServerIp  (diag 下载走 $Transport)"
+KeyVal 'Boot'       $(if ($BootMedia -eq 'usb') { 'U 盘冷启动（U 盘要你自备，脚本不写盘）' } else { 'TFTP 自动取 initramfs（PC 起 TFTP 服务）' })
 KeyVal 'U-Boot'     $(if ($Uboot -eq 'ng') { 'uboot_ng.bin（本项目，需 1 MiB 分区）' } else { 'clayface uboot_mx64 / uboot_mx64_small（按 mtd0 自动选）' })
 KeyVal 'Sysupgrade' $(if ($SkipSysupgrade) { '跳过' } elseif ($SysupgradeFile) { $SysupgradeFile } else { '自动选最新的（按 A0/B0+ 匹配）' })
 KeyVal 'Backup'     '跳过（默认）。要备份见 README 第 8 节，在 initramfs 里用 scp 拉'
@@ -169,8 +173,8 @@ if ($DryRun) {
     Note 'wc -c < /tmp/<img> ; md5sum /tmp/<img>                            # 校验（PC 比对）'
     Note 'insmod /tmp/mtd-rw.ko i_want_a_brick=1                            # 仅当 mtd0 只读'
     Note 'dd if=/tmp/<img> of=/dev/mtdblock0    或   ./mtd write /tmp/<img> /dev/mtd0'
-    Note 'dd if=/dev/mtdblock0 bs=1024 count=64 | md5sum                     # 回读比对'
-    Note 'reboot'
+    Note 'dd if=/dev/mtd0 bs=65536 skip=<n> count=1    # 整镜像回读（10 块，PC 逐字节比对）'
+    Note '（不发 reboot）-> 提示你拔电、插 U 盘、上电'
     Rule 'DarkYellow'
     return
 }
@@ -217,7 +221,7 @@ if ($pyM.Success) {
     Ok "python $pyMajor.$pyMinor 可用"
 }
 
-# ---- 权限 / 防火墙：U-Boot 只会 TFTP，入站 UDP 69 被拦就拉不到镜像 ----
+# ---- 权限 / 防火墙：设备要从 PC 下载，入站端口被拦就前功尽弃 ----
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
     [Security.Principal.WindowsBuiltInRole]::Administrator)
 if ($isAdmin) { Ok '以管理员运行' }
@@ -238,9 +242,15 @@ if ($nicAlias) {
 }
 
 # ---- 端口占用：上一轮没退干净的 python 服务会让本轮第 2 阶段直接失败 ----
+# 只检查这轮真的要用到的端口：HTTP 给 diag 下载；TFTP 只在 -BootMedia tftp 时需要。
+# （diag 模式的设备只有一个 wget、没有 tftp 客户端，所以下载一律走 HTTP）
+if ($Transport -eq 'tftp') { Warn '-Transport tftp 无效：diag 的 busybox 没有 tftp 客户端，下载仍走 HTTP' }
+$needTftp = ($BootMedia -eq 'tftp')
 $busy = @()
-$udp69 = @(Get-NetUDPEndpoint -LocalPort 69 -ErrorAction SilentlyContinue)
-if ($udp69.Count -gt 0) { $busy += "UDP 69 被 pid $((($udp69 | Select-Object -ExpandProperty OwningProcess) -join ',')) 占用（TFTP）" }
+if ($needTftp) {
+    $udp69 = @(Get-NetUDPEndpoint -LocalPort 69 -ErrorAction SilentlyContinue)
+    if ($udp69.Count -gt 0) { $busy += "UDP 69 被 pid $((($udp69 | Select-Object -ExpandProperty OwningProcess) -join ',')) 占用（TFTP）" }
+}
 $tcpPort = @(Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue)
 if ($tcpPort.Count -gt 0) { $busy += "TCP $Port 被 pid $((($tcpPort | Select-Object -ExpandProperty OwningProcess) -join ',')) 占用（HTTP）" }
 if ($busy.Count -gt 0) {
@@ -250,7 +260,7 @@ if ($busy.Count -gt 0) {
     Note '  Get-CimInstance Win32_Process -Filter "Name=''python.exe''" | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }'
     throw '端口被占用'
 }
-Ok "端口空闲（UDP 69 / TCP $Port）"
+Ok ("端口空闲（{0}）" -f $(if ($needTftp) { "UDP 69 / TCP $Port" } else { "TCP $Port" }))
 
 # ---- 本地镜像完整性：避免刷进旧版本或下坏的镜像 ----
 # 优先用 SHA256SUMS（覆盖 files/ 下全部文件）；没有它才退回逐个 sidecar
@@ -321,6 +331,7 @@ Phase 2 '启动传输服务'
 
 $servers = @()
 $logs = @{}
+$keepServers = $false
 $httpLog = Join-Path $env:TEMP 'mx64-http.log'
 $servers += Start-Process python -ArgumentList '-m', 'http.server', "$Port", '--bind', '0.0.0.0', '--directory', $stage `
     -PassThru -WindowStyle Hidden -RedirectStandardOutput $httpLog -RedirectStandardError "$httpLog.err"
@@ -333,25 +344,26 @@ function Stop-Servers {
     }
 }
 
-# TFTP 无条件起：刷完重启后是 U-Boot 去拉 initramfs，而 U-Boot 只会 TFTP。
-# -Transport 只决定 diag 模式里设备用哪种方式下载（那部分 HTTP/TFTP 都行）。
+# TFTP 只在 -BootMedia tftp 时起：那种模式下 U-Boot 会自己来取 initramfs。
+# 默认（U 盘冷启动）根本不需要 TFTP，起了只是白占 UDP 69、还得处理权限。
 $tftpOk = $false
 $tftpLog = Join-Path $env:TEMP 'mx64-tftp.log'
-# 注意：$PSScriptRoot 里可能有空格（cisco mx64），Start-Process 的 -ArgumentList 不自动加引号
-$tftpPy = '"{0}"' -f (Join-Path $PSScriptRoot '70-tftp-server.py')
-$servers += Start-Process python -ArgumentList $tftpPy, '--dir', "`"$stage`"", '--port', '69' `
-    -PassThru -WindowStyle Hidden -RedirectStandardOutput $tftpLog -RedirectStandardError "$tftpLog.err"
-$logs['tftp'] = $tftpLog
-Start-Sleep -Milliseconds 900
-if ($servers[-1].HasExited) {
-    Warn 'TFTP 起不来（UDP 69 需要管理员权限）'
-    if (-not $Check) {
-        Warn '刷完重启后 U-Boot 会拿不到 initramfs，会停在 U-Boot 提示符！'
-        Warn '要么用管理员 PowerShell 重跑，要么刷完手动在 U-Boot 里 tftp'
+if ($needTftp) {
+    # 注意：$PSScriptRoot 里可能有空格（cisco mx64），Start-Process 的 -ArgumentList 不自动加引号
+    $tftpPy = '"{0}"' -f (Join-Path $PSScriptRoot '70-tftp-server.py')
+    $servers += Start-Process python -ArgumentList $tftpPy, '--dir', "`"$stage`"", '--port', '69' `
+        -PassThru -WindowStyle Hidden -RedirectStandardOutput $tftpLog -RedirectStandardError "$tftpLog.err"
+    $logs['tftp'] = $tftpLog
+    Start-Sleep -Milliseconds 900
+    if ($servers[-1].HasExited) {
+        Bad 'TFTP 起不来（UDP 69 被占用或被防火墙拦）'
+        Note "详情: $tftpLog.err"
+        throw 'TFTP 服务启动失败'
     }
-} else {
     $tftpOk = $true
     Ok "TFTP  $tftpBase  (pid $($servers[-1].Id), UDP 69)"
+} else {
+    Note '不启动 TFTP（启动阶段用 U 盘）'
 }
 
 try {
@@ -595,9 +607,11 @@ try {
     if ($localSize -gt $mtd0Size) { Bad "$target ($localSize 字节) 超过 mtd0 ($mtd0Size 字节)"; throw '镜像放不下' }
     Ok "将刷入 $target ($localSize 字节, md5 $localMd5)"
 
+    # FIT initramfs 的文件名必须和 U-Boot 内置的 initramfs_filename / initramfs_filename_a0 完全一致
+    $fitName = if ($variant -eq 'a0') { 'openwrt-bcm53xx-generic-meraki_mx64-a0-initramfs.bin' }
+               else { 'openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin' }
+
     if ($Check) {
-        $fitName = if ($variant -eq 'a0') { 'openwrt-bcm53xx-generic-meraki_mx64-a0-initramfs.bin' }
-                   else { 'openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin' }
         $transName = if ($variant -eq 'a0') { 'openwrt-bcm5862x-generic-meraki_mx64a0-initramfs-kernel.bin' }
                      else { 'openwrt-bcm5862x-generic-meraki_mx64-initramfs-kernel.bin' }
         $sysPat = if ($variant -eq 'a0') { 'openwrt-*-meraki_mx64-a0-squashfs.sysupgrade.bin' }
@@ -631,7 +645,7 @@ try {
             Note '2) 里面跑 30-write-uboot-from-openwrt.sh 换成 1 MiB 布局'
             Note '3) sysupgrade（不要单独重启去测 U-Boot）'
         } else {
-            Note '1) 重启 -> U-Boot 自动 UBI->USB->TFTP，拉 FIT initramfs（bootm）'
+            Note '1) 拔电 -> 插 U 盘 -> 上电（U-Boot 走 USB，白灯闪三下后加载）'
             Note '2) scp sysupgrade 到 /tmp'
             Note '3) ssh 里 sysupgrade -n'
         }
@@ -801,33 +815,89 @@ try {
     Ok '写入完成'
 
     # 10) 回读比对
-    Step '回读 mtd0 前 512 字节比对'
+    # 只比前 512 字节不够：真机上出现过头部对、后面是垃圾的情况。这里把整份镜像读回来逐字节比。
     # 从字符设备读，避开 mtdblock 的页缓存（否则可能读到写之前的旧数据）
     $rbSrc = if ($hasMtd0) { '/dev/mtd0' } else { '/dev/mtdblock0' }
-    $rb = Invoke-Dev "dd if=$rbSrc bs=512 count=1 2>/dev/null" -TimeoutSec 120 -Binary
-    if ($rb.Code -ne 0 -or $rb.Bytes.Length -lt $headLen) {
-        Warn "回读失败（exit=$($rb.Code), $($rb.Bytes.Length) 字节），无法确认，请自己核对"
-    } else {
-        $rbHex = (($rb.Bytes[0..($headLen - 1)] | ForEach-Object { '{0:x2}' -f $_ }) -join '')
-        if ($rbHex -ne $localHeadHex) {
-            Bad '回读和镜像不一致！'
-            Note ("nand: " + $rbHex.Substring(0, [Math]::Min(64, $rbHex.Length)) + '...')
-            Note ("file: " + $localHeadHex.Substring(0, [Math]::Min(64, $localHeadHex.Length)) + '...')
-            throw '回读校验失败'
+    $localAll = [System.IO.File]::ReadAllBytes($localPath)
+    $chunkSize = 65536
+    $chunks = [int][Math]::Ceiling($localAll.Length / [double]$chunkSize)
+    Step "回读 mtd0 整镜像比对（$localSize 字节，$chunks 块）"
+
+    $got = New-Object byte[] $localAll.Length
+    $firstBad = -1
+    $readProblem = $null
+    for ($ci = 0; $ci -lt $chunks; $ci++) {
+        $off = $ci * $chunkSize
+        $want = [Math]::Min($chunkSize, $localAll.Length - $off)
+        $rb = Invoke-Dev "dd if=$rbSrc bs=$chunkSize skip=$ci count=1 2>/dev/null" -TimeoutSec 180 -Binary
+        if ($rb.Code -ne 0 -or $rb.Bytes.Length -lt $want) {
+            $readProblem = ("第 {0}/{1} 块回读不足（exit={2}，拿到 {3} 字节，期望 {4}）" -f ($ci + 1), $chunks, $rb.Code, $rb.Bytes.Length, $want)
+            break
         }
-        Ok "回读一致（前 $headLen 字节）"
+        [Array]::Copy($rb.Bytes, 0, $got, $off, $want)
+        for ($k = 0; $k -lt $want; $k++) {
+            if ($got[$off + $k] -ne $localAll[$off + $k]) { $firstBad = $off + $k; break }
+        }
+        if ($firstBad -ge 0) { break }
+        Write-Host ("`r          {0}/{1} 块一致" -f ($ci + 1), $chunks) -NoNewline -ForegroundColor DarkGray
+    }
+    Write-Host ''
+
+    if ($firstBad -ge 0) {
+        Bad ("回读和镜像不一致，第一个不同的字节在 0x{0:x}（NAND 0x{1:x2} / 文件 0x{2:x2}）" -f $firstBad, $got[$firstBad], $localAll[$firstBad])
+        Note '不要拔电重启 —— 这段就是起不来的原因。重跑本脚本再写一次'
+        throw '回读校验失败'
+    }
+    if ($readProblem) {
+        Warn "整镜像回读没做完：$readProblem"
+        Note '写入本身已成功（上面 mtd/dd 没报错），只是没法全量确认，继续'
+    } else {
+        Ok "回读一致（整份 $localSize 字节，$chunks 块逐字节比对）"
     }
 
-    # ------------------------------------------------------------- [4] 重启
-    Send-Line $stream 'reboot'
-    Start-Sleep -Milliseconds 600
-    try { $client.Close() } catch { }
+    # ------------------------------------------------------------- [4] 启动
+    if ($BootMedia -eq 'tftp') {
+        # 老路子：让设备自己 reboot，U-Boot 会走 UBI(空) -> USB(没插) -> TFTP 来取 initramfs
+        Send-Line $stream 'reboot'
+        Start-Sleep -Milliseconds 600
+        try { $client.Close() } catch { }
+        Phase 4 '重启并等待 initramfs 起来（TFTP）'
+        Note 'U-Boot 顺序：UBI（空）-> USB（没插）-> TFTP，所以会自己来取镜像'
+    } else {
+        Phase 4 '冷启动：拔电 -> 插 U 盘 -> 上电'
 
-    Phase 4 '重启并等待 initramfs 起来'
-    Note 'U-Boot 顺序：UBI（空）-> USB（没插）-> TFTP，所以会自己来取镜像'
+        Write-Host ''
+        Write-Host '  mtd0 已写入并整份回读一致。接下来不要 reboot。' -ForegroundColor White
+        Write-Host '  两台真机实测：写完 mtd0 发 reboot，设备都不回来（常亮橙、网络全死）；' -ForegroundColor White
+        Write-Host '                拔电源冷启动才进得去 U-Boot。' -ForegroundColor White
+        Write-Host ''
+        Write-Host '  请按这个顺序做：' -ForegroundColor Yellow
+        Write-Host '    1) 拔掉 MX64 的电源，等 3 秒' -ForegroundColor Yellow
+        Write-Host '    2) 把 U 盘插到 MX64 的 USB 口' -ForegroundColor Yellow
+        Write-Host '    3) 插上电源' -ForegroundColor Yellow
+        Write-Host ''
+        Note 'U 盘要求（脚本不替你写盘，自己拷一个文件进去就行）：'
+        Note '  - 单个分区，FAT16 或 FAT32'
+        Note '  - 文件放在分区根目录（不要放进子目录）'
+        Note "  - 文件名必须一字不差：$fitName"
+        $usbSrc = Join-Path $filesDir $fitName
+        if (Test-Path $usbSrc) {
+            Note ("  - 源文件就是：files\$fitName  ({0:N1} MB, md5 {1})" -f `
+                    ((Get-Item $usbSrc).Length / 1MB), (Get-FileHash $usbSrc -Algorithm MD5).Hash.ToLower())
+        } else {
+            Warn "files\ 里没有 $fitName —— 你得自己准备（U-Boot 只认这个文件名）"
+        }
+        Write-Host ''
+        Note '灯语：白灯闪三下 = U-Boot 找到 U 盘开始加载；常亮橙 = 还在跑 / 没找到 U 盘；绿灯 = 系统起来了'
+        Note '不想用 U 盘：加 -BootMedia tftp 重跑，让 U-Boot 自己 TFTP 取镜像（PC 要起 TFTP）'
+        Write-Host ''
 
-    # 等 22 端口是"结果"，过程要盯着 TFTP 日志：
-    # U-Boot 只有在真跑 tftpboot 时才会起网卡，日志一有请求就说明它活着。
+        try { Send-Line $stream 'exit' } catch { }
+        Start-Sleep -Milliseconds 300
+        try { $client.Close() } catch { }
+    }
+
+    # 等设备把系统跑起来：唯一判据是 22 端口
     $t0 = Get-Date
     $sawTftp = $false
     $hinted = $false
@@ -835,7 +905,7 @@ try {
     while (((Get-Date) - $t0).TotalSeconds -lt $BootTimeoutSec) {
         $el = [int]((Get-Date) - $t0).TotalSeconds
 
-        if (-not $sawTftp -and (Test-Path $tftpLog)) {
+        if ($needTftp -and -not $sawTftp -and (Test-Path $tftpLog)) {
             $hit = Get-Content $tftpLog -EA SilentlyContinue |
                    Where-Object { $_ -match '->\s*192\.168|NOT FOUND' } | Select-Object -Last 1
             if ($hit) {
@@ -846,22 +916,30 @@ try {
 
         if (Test-Port -IP $DeviceIp -PortNo 22 -Ms 800) { $booted = $true; break }
 
-        if (-not $sawTftp -and -not $hinted -and $el -ge $HintSec) {
+        if (-not $hinted -and $el -ge $HintSec) {
             $hinted = $true
             Write-Host ''
-            Warn ("已经 $el 秒还没收到任何 TFTP 请求")
-            Note '可能原因（按概率）：'
-            Note '  1) U-Boot 在做 Shmoo 校准（首次启动正常，可能需要几分钟）'
-            Note '  2) U-Boot 卡在提示符 / 校验不过 —— 需要接串口看'
-            Note '  3) 写进 mtd0 的 U-Boot 起不来'
-            Note '判断办法：看灯的形态（白闪 3 下=USB boot，常橙=启动中，绿=起来了，橙白交替=UBI 失败）'
-            Note '        接串口 J1（115200 8N1）能直接看到 U-Boot 输出'
+            Warn ("已经 $el 秒还没等到 $DeviceIp`:22 打开")
+            if ($BootMedia -eq 'usb') {
+                Note '按顺序查这几条：'
+                Note '  1) 是拔电源冷启动的吗？只按 reboot 起不来，必须拔电'
+                Note '  2) U 盘是 FAT16/FAT32、单分区、文件在根目录吗？'
+                Note "  3) 文件名一字不差吗？$fitName"
+                Note '  4) 白灯闪三下了吗？闪了=U-Boot 找到盘开始加载；没闪=U-Boot 没走到 USB 这一步'
+                Note '  5) 换一个 U 盘试试（个别盘 U-Boot 的 EHCI 认不出来）'
+            } else {
+                Note '按顺序查这几条：'
+                Note '  1) TFTP 服务还活着吗（UDP 69 在监听）'
+                Note '  2) 网线在 LAN 口、PC 是 192.168.1.2/24 吗'
+                Note '  3) 防火墙拦了入站吗'
+            }
+            Note '接串口 J1（115200 8N1, 3.3V TTL）能直接看到 U-Boot 每一句输出'
             Note '继续等待中……'
             Write-Host ''
         }
 
-        if ($el % 10 -eq 0) {
-            $state = if ($sawTftp) { 'U-Boot 已取镜像，等系统起来' } else { '还没收到 TFTP 请求' }
+        if ($el % 15 -eq 0) {
+            $state = if ($sawTftp) { 'U-Boot 已取镜像，等系统起来' } else { '等设备启动' }
             Note ("  {0,4}s  {1}" -f $el, $state)
         }
         Start-Sleep -Milliseconds 1000
@@ -869,19 +947,25 @@ try {
 
     if (-not $booted) {
         Bad ("等了 $BootTimeoutSec 秒，$DeviceIp`:22 还是连不上")
-        if (-not $sawTftp) {
+        if ($BootMedia -eq 'usb') {
+            Note 'mtd0 里确实写进了 U-Boot（整镜像逐字节回读一致），所以问题在"启动时没找到 U 盘"或"根本没冷启动"'
+            Note '先只做一件事：拔电源 -> 插 U 盘 -> 插电源，然后盯前面板的灯看一遍'
+            Note '白灯一次都不闪 => U-Boot 没走到 usb_boot 那一步，只能接串口 J1 查（115200 8N1, 3.3V TTL）'
+        } elseif (-not $sawTftp) {
             Bad '全程没收到一次 TFTP 请求 -> U-Boot 根本没走到网络这一步'
             Note '不要重复刷 U-Boot。先断电重上电再观察一次；仍不行就接串口'
         } else {
             Warn 'U-Boot 成功取了镜像，但系统没起来（可能内核/DTB 与 SoC 版本不匹配）'
             Note '接串口看 bootm 之后的输出'
         }
+        # 别把服务关掉：超时可能只是人工操作慢，用户想马上再试一次
+        $keepServers = $true
         throw '第 4 阶段失败'
     }
     Ok 'initramfs 已启动（ssh 端口打开）'
 
     # ------------------------------------------------------------- [5] 关服务
-    Phase 5 '关闭 TFTP / HTTP'
+    Phase 5 '关闭传输服务'
     Stop-Servers
     Ok '传输服务已停止（设备已经在 RAM 里跑系统，不再需要）'
 
@@ -954,9 +1038,11 @@ catch {
     Write-Host ("  中断: " + $_.Exception.Message) -ForegroundColor Red
     Rule 'DarkRed'
     Note ("日志: $httpLog" + $(if ($logs['tftp']) { "  " + $logs['tftp'] } else { '' }))
-    Stop-Servers
+    if (-not $keepServers) { Stop-Servers }
+    else { Warn 'HTTP 服务还在跑（想马上重试就直接再跑一遍脚本）' }
     exit 1
 }
 finally {
-    Stop-Servers
+    # 第 4 阶段超时不关服务：那种情况多半是人工操作慢，用户会想立刻再试
+    if (-not $keepServers) { Stop-Servers }
 }

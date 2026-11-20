@@ -57,7 +57,9 @@ ubinfo -a                     # 有 rootfs_data 卷 => 已装好
 |---|---|
 | 第一次装 U-Boot 要按 reset 吗？ | **要**。原厂固件只有 diagnostic mode 给 shell |
 | 之后刷 initramfs 还要按 reset 吗？ | **不用**（用本项目的 U-Boot）。引导顺序 UBI → USB → TFTP，前一个失败自动试下一个 |
-| 刷机脚本默认走什么传输？ | **TFTP**；起不来或设备没有 tftp 时自动回退 HTTP |
+| 刷机脚本怎么把系统弄起来？ | **U 盘冷启动**：写完后拔电 → 插 U 盘（放一个 initramfs）→ 上电。U 盘要你自备，脚本不写盘 |
+| 为什么不直接 `reboot`？ | 两台真机实测，写完 mtd0 发 `reboot` 设备都回不来（常亮橙、网络全死），只有拔电冷启动进得去 U-Boot |
+| U 盘上放 sysupgrade 能自动装吗？ | **不能**。U-Boot 的 USB 路径只 `fatload` + `bootm`，从不写 NAND；而且只认两个固定文件名，也只认 FIT/uImage/SPIM 三种 magic |
 | 备份原厂分区吗？ | **默认跳过**（见「备份」一节，要备份需手动做） |
 | 一条命令能刷完吗？ | 能：`scripts\00-flash.ps1` 一路到 sysupgrade |
 
@@ -108,12 +110,14 @@ cd "C:\Users\Peter\Desktop\cisco mx64\mx64-openwrt-flash-kit"
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -DryRun     # 看计划
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Check      # 只读设备、出结论
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Probe      # 只验证 mtd 工具，不擦不写
-powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1             # 真刷（默认 TFTP）
+powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1             # 真刷（默认 HTTP 下载 + U 盘冷启动）
 ```
 
-TFTP 会**无条件启动**（刷完重启后是 U-Boot 去拉 initramfs，而 U-Boot 只会 TFTP）。
-Windows 上绑 UDP 69 不需要管理员权限，但网卡若在「公用网络」配置下，防火墙可能拦入站。
-`-Transport` 只决定 diag 模式里设备用哪种方式下载。
+第 2 阶段**只起一种服务**：diag 模式下设备要靠 `wget` 把镜像拉进去，所以 HTTP 一定起；
+TFTP 只在 `-BootMedia tftp` 时起（那种模式下 U-Boot 会自己来取 initramfs）。
+默认的 U 盘流程根本不需要 TFTP。
+
+> diag 的 busybox 只有一个 `wget`，**没有 tftp 客户端**，所以 `-Transport tftp` 无效，下载一律走 HTTP。
 
 ### [1] 环境检查查什么
 
@@ -125,8 +129,8 @@ Windows 上绑 UDP 69 不需要管理员权限，但网卡若在「公用网络�
 | python >= 3.7 | `http.server --directory` 需要 3.7 |
 | ssh / scp 存在 | 第 6 阶段要用；没有就自动跳过 sysupgrade |
 | 是否管理员 | Windows 绑 UDP 69 **不需要**管理员，只是提示 |
-| 网卡防火墙配置 | 若是「公用网络」会警告 —— U-Boot 的 TFTP 回复可能被拦 |
-| **UDP 69 / TCP 8000 是否被占用** | 上一轮没退干净的 python 服务会让第 2 阶段直接失败 |
+| 网卡防火墙配置 | 若是「公用网络」会警告 —— 设备的入站请求可能被拦 |
+| **端口是否被占用** | 只查本轮真用到的：`TCP 8000`（HTTP）；`-BootMedia tftp` 时再加 `UDP 69`。上一轮没退干净的 python 服务会让第 2 阶段直接失败 |
 | **`files/` 里所有镜像的完整性** | 优先按 `SHA256SUMS` 逐个比对（覆盖 12 个文件）；没有 `SHA256SUMS` 才退回 `*.sha256` / `*.sha512` sidecar。防止刷进旧版本或下坏的镜像 |
 | **U-Boot 版本 tag** | 从 `uboot_ng.bin` 里抓 `mx64-ng-*`，一眼确认刷的是哪个构建 |
 | C 盘剩余空间 | 暂存要 ~35 MB |
@@ -149,10 +153,10 @@ Windows 上绑 UDP 69 不需要管理员权限，但网卡若在「公用网络�
 | 阶段 | 干什么 |
 |---|---|
 | [1] 环境检查 | 见上表 |
-| [2] 起服务 | TFTP(UDP 69) + HTTP 备用 |
-| [3] 刷 U-Boot | telnet 进设备，逐条发命令：能力探测 → 读 `mtd0`/写保护/SoC → 决定刷哪个 → 设备 `wget` 下载 → PC 比对长度和 md5 → （按需）`insmod mtd-rw.ko` 解锁 → `dd` 或 `mtd write` → 回读前 64 KiB 比对 |
-| [4] 重启 | 发 `reboot`，U-Boot 自动 UBI→USB→TFTP 拉 initramfs，等 22 端口 |
-| [5] 关服务 | 停掉 TFTP/HTTP（系统已在 RAM 里跑） |
+| [2] 起服务 | 只起 HTTP（`-Transport` 那一种），给 diag 下载用 |
+| [3] 刷 U-Boot | telnet 进设备，逐条发命令：能力探测 → 读 `mtd0`/写保护/SoC → 决定刷哪个 → 设备 `wget` 下载 → PC 比对长度和 md5 → （按需）`insmod mtd-rw.ko` 解锁 → `dd` 或 `mtd write` → **整份镜像回读逐字节比对** |
+| [4] 冷启动 | **不发 `reboot`**。打印 U 盘要求，让你拔电 → 插 U 盘 → 上电，然后等 22 端口（默认 900 秒） |
+| [5] 关服务 | 停掉 HTTP（系统已在 RAM 里跑） |
 | [6] sysupgrade | `scp` 上传 → `ssh sysupgrade -n` → 等系统重启回来 |
 
 第 3 阶段设备上实际执行的命令（就是这么几条，逻辑都在 PC）：
@@ -167,9 +171,18 @@ wc -c < /tmp/uboot_ng.bin
 md5sum /tmp/uboot_ng.bin
 insmod /tmp/mtd-rw.ko i_want_a_brick=1          # 仅当 ro=1
 cd /tmp && ./mtd write /tmp/uboot_ng.bin /dev/mtd0    # 或 dd if=/tmp/uboot_ng.bin of=/dev/mtdblock0
-dd if=/dev/mtdblock0 bs=1024 count=64 | md5sum
-reboot
+dd if=/dev/mtd0 bs=65536 skip=0 count=1 2>/dev/null   # 整镜像回读：skip=0..9，共 10 块
 ```
+
+第 4 阶段不带 `-BootMedia tftp` 时，脚本做的事只有：
+
+```
+打印 U 盘要求（分区 1 / FAT16|FAT32 / 根目录 / 文件名一字不差）
+等 192.168.1.1:22 打开，最长 900 秒
+```
+
+**为什么不发 `reboot`**：两台真机都是写完 mtd0 → `reboot` → 设备再也不回来（常亮橙、无网络），
+而拔电源冷启动 + 插 U 盘一次就成功（约 77 秒起 initramfs）。所以脚本只管告诉你什么时候拔电。
 
 ### 开关
 
@@ -180,7 +193,9 @@ reboot
 | `-DryRun` | 只打印计划 |
 | `-SkipSysupgrade` | 刷完 U-Boot、进了 initramfs 就停 |
 | `-Uboot clayface` | 改刷 clayface 的 `uboot_mx64`（默认 `uboot_ng.bin`） |
-| `-Transport http` | 不用 TFTP，免管理员 |
+| `-BootMedia tftp` | 改成让 U-Boot 自己 TFTP 取 initramfs（默认 `usb`，只给指示不写盘） |
+| `-BootTimeoutSec <秒>` | 第 4 阶段等 22 端口多久，默认 **900** |
+| `-Transport http` | diag 下载方式，默认就是 http（`tftp` 无效：设备没有 tftp 客户端） |
 | `-SysupgradeFile <路径>` | 指定 sysupgrade 镜像（默认按 A0/B0+ 自动挑最新的） |
 
 ### 输出长这样
@@ -200,7 +215,8 @@ reboot
    [ ok ] md5 一致 (648a8d98...)
    [ ok ] mtd0 已解锁（ro=0）
    [ ok ] 写入完成
-   [ ok ] 回读一致 (e8100695...)
+          1/10 块一致 ... 10/10 块一致
+   [ ok ] 回读一致（整份 598268 字节，10 块逐字节比对）
 ```
 
 ## 手动命令（自动流程不适用时的兜底）
@@ -236,10 +252,12 @@ dmesg | tail -5                    # 应该有 mtd-rw: mtd0: setting writeable f
 # 或者（mtd0 本来可写时）
 dd if=/tmp/uboot_ng.bin of=/dev/mtdblock0
 
-dd if=/dev/mtd0 bs=512 count=1 | hexdump -C    # 有 hexdump 的话看头是不是 07 05 00 ea
+# 回读校验：整份镜像分 10 块读回来，PC 侧逐字节比（设备没有 md5sum）
+dd if=/dev/mtd0 bs=65536 skip=0 count=1 2>/dev/null    # skip=0..9
+
 sync
-# wiki 第 8 步是"断电"。不接串口就 reboot，起不来再断电重上
-reboot
+# 然后断电（不要 reboot）：拔电源 -> 插 U 盘 -> 上电
+# U 盘根目录放 openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin（A0 机是 ...-a0-initramfs.bin）
 ```
 
 ## 分步细节（脚本不适用时逐条对着做）
@@ -254,11 +272,26 @@ reboot
 
 `00-flash.ps1` 会自动做这三件事并给出结论（`-Check` 只看不写）。
 
-### 1. 准备 U 盘（只有走 USB 路径需要）
+### 1. 准备 U 盘（`-BootMedia usb`，默认路径）
 
-- MBR 分区表，第一个分区 FAT32（wiki 建议 FAT16 128 MB）
-- 根目录只放本工具包的文件，不要留旧的 `openwrt-*`
-- 写入：`powershell -ExecutionPolicy Bypass -File scripts\02-copy-to-usb.ps1 -Drive E:\`
+写 mtd0 之后靠它把这台机器重新拉起来。**脚本不写盘**，你手动拷一个文件就行：
+
+- 单个分区，**FAT16 或 FAT32**（MBR 分区表）
+- 文件放在**分区根目录**，不要放子目录
+- 文件名必须和 U-Boot 内置的完全一致：
+  - B0+ / 未知：`openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin`
+  - A0：`openwrt-bcm53xx-generic-meraki_mx64-a0-initramfs.bin`
+- 两个文件都在 `files/` 里，6.0 MB，直接拷
+
+`files/` 里其他东西（sysupgrade、过渡固件、`uboot_ng.bin`）**U 盘上都不需要** ——
+U-Boot 只认上面那两个名字，而且只 `fatload` + `bootm`，从不写 NAND。
+
+```
+E:\
+└─ openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin     ← 只需要这一个
+```
+
+`scripts\02-copy-to-usb.ps1 -Drive E:\` 会帮你把整套文件拷过去（多拷了也无害）。
 
 ### 2. PC 侧服务
 
@@ -287,13 +320,14 @@ powershell -ExecutionPolicy Bypass -File scripts\01-serve-http.ps1 # HTTP，:800
    （脚本会先探 mtd0 可写性；出厂带写保护的机器在 OpenWrt 下写不了，
    那种机器只能走「让 U-Boot 自己刷自己」）
 4. **不要重启**，直接 sysupgrade
-5. 换完第一次启动要重做 Shmoo 校准，会很慢（几分钟）
 
 ### 5. 启动 OpenWrt（正常路径）
 
-用本项目的 U-Boot 时**不用按 reset**：
+用本项目的 U-Boot 时**不用按 reset**，但**必须拔电冷启动**（`reboot` 之后设备起不来，两台真机都一样）：
 
 ```
+拔电源 -> 插 U 盘 -> 插电源
+
 UBI 能起内核        -> 直接起 OpenWrt
 UBI 起不来（空/坏） -> 自动 usbload（U 盘，3 次尝试 / 2 条总线 / 2 个文件名）
 U 盘也不行          -> 自动 tftp_boot（网络）
@@ -361,8 +395,10 @@ wget http://192.168.1.2:8000/60-reclaim-space.sh && sh 60-reclaim-space.sh
 | insmod 报 `File exists` | 模块之前已经加载过，**不是失败**；看 `/proc/modules` 有没有 `mtd_rw` |
 | 解锁后 `/sys/block/mtdblock0/ro` 还是 1 | **正常，别管它**。那是块设备的静态属性，`mtd-rw` 改的是 `mtd->flags`，sysfs 不会跟着变。判据应该是 `/proc/modules` 里有 `mtd_rw`，或 dmesg 有 `mtd-rw: mtd0: setting writeable flag` |
 | `mtd: Could not open mtd device: mtd0` | 这个 `mtd` 只认 **`/dev/mtd0` 全路径**，传 `mtd0` 或 label `boot` 都不行 |
-| 回读 md5 不一致 | 不要断电，重跑一次写入 |
-| 换 U-Boot 后长时间橙白闪 | Shmoo 校准中；等几分钟，不行断电再上电；仍失败用 U 盘 initramfs 重装，**别再刷 U-Boot** |
+| 回读和镜像不一致 | 不要断电重启 —— 那段就是起不来的原因。直接重跑脚本再写一次 |
+| 写完 mtd0，设备不回来了（常亮橙、无网络） | 别用 `reboot`，拔电源冷启动 + 插 U 盘。两台真机都是这个规律 |
+| 插了 U 盘但白灯一次都不闪 | U-Boot 没走到 `usb_boot`。检查 U 盘是 FAT16/FAT32 单分区、文件名一字不差；换个 U 盘再试；仍不行接串口 J1（115200 8N1） |
+| 白灯闪三下后又回到常亮橙 | `fatload` 成功了但 `bootm` 失败 —— 文件名对但内容不对（比如放成了 sysupgrade） |
 | 装完只有 ~370 MiB 可用 | 见第 8 节 |
 
 ## mtd0 写不进去时，改 U-Boot 环境
@@ -392,7 +428,7 @@ mtd erase u-boot-env
 dd if=/tmp/uboot-env.bin of=/dev/mtd3 bs=4096
 sync
 dd if=/dev/mtd3 bs=4096 count=64 | md5sum    # 和本地比对
-reboot
+# 断电（不要 reboot）：拔电源 -> 插 U 盘（initramfs）-> 上电
 ```
 
 `files/uboot-env.bin` 就是这份（crc `0x7b2ae92f`，md5 `7e35ca65061087b233b093161e94ce05`），
