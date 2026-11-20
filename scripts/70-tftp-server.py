@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""极简 TFTP 服务器（只支持 RRQ 下载），给 U-Boot 的 tftpboot / flash_uboot 用。
+
+    python 70-tftp-server.py                    # 服务 ../files，UDP 69
+    python 70-tftp-server.py --dir files --port 6969
+
+U-Boot 的 tftpboot 固定连 UDP 69，所以默认端口需要管理员权限：
+    Windows: 以管理员身份运行 PowerShell
+    Linux:   sudo
+
+实现 RFC1350 octet 模式，512 字节块，不协商选项（U-Boot 未设 tftpblocksize 时
+也不会请求选项）。不做上传。
+"""
+
+import argparse
+import os
+import socket
+import struct
+import sys
+import threading
+
+OP_RRQ = 1
+OP_WRQ = 2
+OP_DATA = 3
+OP_ACK = 4
+OP_ERROR = 5
+
+ERR_ACCESS = 2
+ERR_NOT_FOUND = 1
+ERR_ILLEGAL = 4
+
+BLOCK = 512
+TIMEOUT = 2.0
+RETRIES = 5
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def send_error(sock, peer, code, text):
+    sock.sendto(struct.pack("!HH", OP_ERROR, code) + text.encode() + b"\0", peer)
+
+
+def serve_file(root, filename, peer):
+    path = os.path.normpath(os.path.join(root, filename.lstrip("/").lstrip("\\")))
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("", 0))
+    s.settimeout(TIMEOUT)
+
+    try:
+        if not path.startswith(root) or not os.path.isfile(path):
+            send_error(s, peer, ERR_NOT_FOUND, "file not found")
+            log("  %-56s NOT FOUND" % filename)
+            return
+
+        with open(path, "rb") as f:
+            payload = f.read()
+
+        log("  %-56s -> %s (%d bytes)" % (filename, peer[0], len(payload)))
+
+        block = 1
+        offset = 0
+        misses = 0
+
+        while True:
+            chunk = payload[offset:offset + BLOCK]
+            s.sendto(struct.pack("!HH", OP_DATA, block & 0xFFFF) + chunk, peer)
+
+            while True:
+                try:
+                    resp, _ = s.recvfrom(1024)
+                except socket.timeout:
+                    misses += 1
+                    if misses > RETRIES:
+                        log("  %-56s timeout, giving up" % filename)
+                        return
+                    break  # 重发同一个块
+
+                if len(resp) < 4:
+                    continue
+                op = struct.unpack("!H", resp[:2])[0]
+                if op == OP_ERROR:
+                    log("  %-56s peer aborted" % filename)
+                    return
+                if op != OP_ACK:
+                    continue
+                if struct.unpack("!H", resp[2:4])[0] == (block & 0xFFFF):
+                    offset += len(chunk)
+                    block += 1
+                    misses = 0
+                    if len(chunk) < BLOCK:
+                        log("  %-56s done" % filename)
+                        return
+                    break
+    finally:
+        s.close()
+
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    ap = argparse.ArgumentParser(description="minimal read-only TFTP server")
+    ap.add_argument("--dir", default=os.path.join(here, "..", "files"))
+    ap.add_argument("--port", type=int, default=69)
+    ap.add_argument("--bind", default="0.0.0.0")
+    args = ap.parse_args()
+
+    root = os.path.abspath(args.dir)
+    if not os.path.isdir(root):
+        sys.exit("no such directory: %s" % root)
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind((args.bind, args.port))
+    except PermissionError:
+        sys.exit("binding UDP %d needs administrator/root" % args.port)
+    except OSError as e:
+        sys.exit("cannot bind UDP %d: %s" % (args.port, e))
+
+    log("TFTP serving %s on %s:%d" % (root, args.bind, args.port))
+    log("Ctrl-C to stop")
+
+    while True:
+        data, peer = sock.recvfrom(2048)
+        if len(data) < 4:
+            continue
+        op = struct.unpack("!H", data[:2])[0]
+        if op == OP_WRQ:
+            send_error(sock, peer, ERR_ACCESS, "read only")
+            continue
+        if op != OP_RRQ:
+            send_error(sock, peer, ERR_ILLEGAL, "only RRQ")
+            continue
+        name = data[2:].split(b"\0")[0].decode(errors="replace")
+        threading.Thread(target=serve_file, args=(root, name, peer), daemon=True).start()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        pass

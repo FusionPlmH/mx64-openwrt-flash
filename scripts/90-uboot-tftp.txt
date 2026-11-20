@@ -1,0 +1,102 @@
+U-Boot 里用 TFTP 升级 bootloader / 引导 initramfs（不用按 reset、不用 U 盘）
+============================================================================
+
+前提：已经刷上本项目编译的 U-Boot（mx64-ng-2012.10-v2 或更新，带 flash_uboot 命令）。
+      PC 网卡设成 192.168.1.2/24，TFTP 服务器跑在 192.168.1.2:69
+      （kit 里：python scripts\70-tftp-server.py，需要管理员权限）。
+
+
+0) 上电后 3 秒内按任意键，停在 U-Boot 提示符（CONFIG_BOOTDELAY=3）
+
+   如果不按键，U-Boot 会按 UBI -> USB -> TFTP -> meraki 的顺序自动尝试，
+   NAND 空/坏时会自己从网络把 initramfs 拉下来，不需要按 reset。
+
+
+1) 看设备状态
+
+   mx64info
+   nand info
+
+   mx64info 里重点看:
+     SoC      : B0+ / A0            <- 决定用哪个 initramfs
+     dts cfg  : config@4 / config@2
+     loadaddr : 90000000
+
+
+2) 设置网络（只需一次，saveenv 之后就不用再设）
+
+   setenv ethaddr 0c:8d:db:90:0a:a0        <- 换成你机器标签上的 MAC
+   setenv ipaddr 192.168.1.10
+   setenv serverip 192.168.1.2
+   setenv netmask 255.255.255.0
+   ping 192.168.1.2
+   saveenv
+
+
+3) 用 TFTP 引导 initramfs（不按 reset）
+
+   tftp_boot
+
+   等价于:
+     tftpboot ${loadaddr} ${initramfs_filename}
+     bootimg ${loadaddr} bootkernel1
+
+   bootimg 会自己看镜像头:
+     d0 0d fe ed (FIT)  -> bootm <addr>#<config@N>
+     53 50 49 4d (SPIM) -> 搬到 0x60008000 后走 bootbk
+
+   想手动指定文件名也行:
+     tftpboot 0x90000000 openwrt-bcm5862x-generic-meraki_mx64-initramfs-kernel.bin
+     bootimg 0x90000000 bootkernel1
+
+
+4) 用 TFTP 直接重写 bootloader（flash_uboot）
+
+   flash_uboot uboot_ng.bin 100000 confirm
+
+   参数:
+     uboot_ng.bin   TFTP 服务器上的文件名
+     100000         mtd0 的真实大小，十六进制。512 KiB 的机器写 80000
+                    （拿不准就先在 OpenWrt 里 cat /proc/mtd）
+     confirm        必须写，否则命令拒绝执行
+
+   它会做:
+     1. tftpboot 到 ${loadaddr}
+     2. 检查首字是不是 ARM 跳转指令、长度是否 <= 分区大小
+     3. nand erase 0 <分区大小>
+     4. nand write ${loadaddr} 0 <文件长度>
+     5. nand read 到 ${verifyaddr}，CRC32 比对
+     6. 只有比对通过才打印 OK
+
+   中途断电 = 变砖，必须接串口救。所以：
+     - 别在没接串口的时候刷
+     - 别用 80000 的机器刷 596 KB 的镜像（会被拒绝）
+     - 校验失败就再跑一次，不要直接 reset
+
+
+5) 512 KiB 分区（mtd0 = 0x80000）的机器
+
+   596 KB 的 uboot_ng.bin 放不进去。先用 clayface 的 uboot_mx64_small 起步，
+   再用过渡固件（openwrt-bcm5862x-...initramfs-kernel.bin）从 U 盘/TFTP 引导，
+   在里面执行：
+
+     mtd write /root/uboot_mx64 /dev/mtd0
+
+   换成 1 MiB 布局之后，就能用 flash_uboot 刷 uboot_ng.bin 了。
+
+
+6) 救砖（U-Boot 还能起来但 NAND 是空的）
+
+   什么都不用按：
+     - 插着带 initramfs 的 U 盘 -> 自动 usbload
+     - 没 U 盘但有 TFTP 服务器 -> 自动 tftp_boot
+     - 想跳过 UBI 引导直接进恢复: setenv disable_ubi_boot 1
+
+
+7) 常用排错
+
+   ping 不通          -> 网线是不是插在 LAN 口、PC 防火墙、ipaddr/serverip 是不是对
+   TFTP timeout       -> PC 上 TFTP 服务器没起（或没管理员权限导致绑不上 UDP 69）
+   Bad Bootkernel magic / No FIT/uImage/SPIM magic
+                      -> 文件不对或没传完整，重新传
+   VERIFY FAILED      -> NAND 写坏了，重新跑 flash_uboot；反复失败就别再刷

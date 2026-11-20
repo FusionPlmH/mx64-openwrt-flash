@@ -14,3 +14,5 @@ files/uboot_mx64        binary
 files/uboot_mx64_small  binary
 *.sha256        text eol=lf
 *.sha512        text eol=lf
+*.py            text eol=lf
+*.txt           text eol=lf
