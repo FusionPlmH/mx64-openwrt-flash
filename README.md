@@ -196,11 +196,14 @@ insmod mtd-rw.ko i_want_a_brick=1
 cat /proc/modules | head -20       # 有 mtd_rw 这行就算成功（ro 仍是 1，正常）
 dmesg | tail -5                    # 应该有 mtd-rw: mtd0: setting writeable flag
 
-# 写入：这个 mtd 只认 /dev/mtd0 全路径；-f 跳过 trx 校验
-./mtd -f write /tmp/uboot_ng.bin /dev/mtd0
+# 写入：mtd0 锁着就 ./mtd write /dev/mtd0，没锁就 dd 写 mtdblock0（这是 wiki 的两种写法）
+./mtd write /tmp/uboot_ng.bin /dev/mtd0
+# 或者（mtd0 本来可写时）
+dd if=/tmp/uboot_ng.bin of=/dev/mtdblock0
 
 dd if=/dev/mtd0 bs=512 count=1 | hexdump -C    # 有 hexdump 的话看头是不是 07 05 00 ea
 sync
+# wiki 第 8 步是"断电"。不接串口就 reboot，起不来再断电重上
 reboot
 ```
 

@@ -16,7 +16,9 @@
 #    [5] 关服务      不再需要 TFTP/HTTP
 #    [6] sysupgrade  scp 上传 + ssh 执行，等系统回来
 #
-#  前提：设备已在 diagnostic mode；PC 网卡 192.168.1.2/24；TFTP 需管理员（-Transport http 可免）
+#  前提：设备已在 diagnostic mode；PC 网卡 192.168.1.2/24。
+#  -Transport 只选 diag 里设备怎么下载；TFTP 永远会起（U-Boot 只会 TFTP），
+#  所以 PowerShell 要用管理员启动，否则刷完重启拉不到 initramfs。
 # =============================================================================
 
 param(
@@ -148,7 +150,7 @@ else { $primary = $httpBase; $fallback = $tftpBase }
 Write-Host ''
 Write-Host '  这次的配置' -ForegroundColor White
 KeyVal 'Device'     "$DeviceIp (telnet 23)"
-KeyVal 'Server'     "$ServerIp  ($Transport 主 / $(if ($Transport -eq 'tftp') { 'http' } else { 'tftp' }) 备)"
+KeyVal 'Server'     "$ServerIp  (diag 用 $Transport 下载 / U-Boot 一律走 tftp)"
 KeyVal 'U-Boot'     $(if ($Uboot -eq 'ng') { 'uboot_ng.bin（本项目，需 1 MiB 分区）' } else { 'clayface uboot_mx64 / uboot_mx64_small（按 mtd0 自动选）' })
 KeyVal 'Sysupgrade' $(if ($SkipSysupgrade) { '跳过' } elseif ($SysupgradeFile) { $SysupgradeFile } else { '自动选最新的（按 A0/B0+ 匹配）' })
 KeyVal 'Backup'     '跳过（默认）。要备份见 README 第 8 节，在 initramfs 里用 scp 拉'
@@ -224,19 +226,25 @@ function Stop-Servers {
     }
 }
 
+# TFTP 无条件起：刷完重启后是 U-Boot 去拉 initramfs，而 U-Boot 只会 TFTP。
+# -Transport 只决定 diag 模式里设备用哪种方式下载（那部分 HTTP/TFTP 都行）。
 $tftpOk = $false
-if ($Transport -eq 'tftp') {
-    $tftpLog = Join-Path $env:TEMP 'mx64-tftp.log'
-    $servers += Start-Process python -ArgumentList (Join-Path $PSScriptRoot '70-tftp-server.py'), '--dir', $stage, '--port', '69' `
-        -PassThru -WindowStyle Hidden -RedirectStandardOutput $tftpLog -RedirectStandardError "$tftpLog.err"
-    $logs['tftp'] = $tftpLog
-    Start-Sleep -Milliseconds 900
-    if ($servers[-1].HasExited) {
-        Warn 'TFTP 起不来（UDP 69 需要管理员权限），改走 HTTP'
-    } else {
-        $tftpOk = $true
-        Ok "TFTP  $tftpBase  (pid $($servers[-1].Id), UDP 69)"
+$tftpLog = Join-Path $env:TEMP 'mx64-tftp.log'
+# 注意：$PSScriptRoot 里可能有空格（cisco mx64），Start-Process 的 -ArgumentList 不自动加引号
+$tftpPy = '"{0}"' -f (Join-Path $PSScriptRoot '70-tftp-server.py')
+$servers += Start-Process python -ArgumentList $tftpPy, '--dir', "`"$stage`"", '--port', '69' `
+    -PassThru -WindowStyle Hidden -RedirectStandardOutput $tftpLog -RedirectStandardError "$tftpLog.err"
+$logs['tftp'] = $tftpLog
+Start-Sleep -Milliseconds 900
+if ($servers[-1].HasExited) {
+    Warn 'TFTP 起不来（UDP 69 需要管理员权限）'
+    if (-not $Check) {
+        Warn '刷完重启后 U-Boot 会拿不到 initramfs，会停在 U-Boot 提示符！'
+        Warn '要么用管理员 PowerShell 重跑，要么刷完手动在 U-Boot 里 tftp'
     }
+} else {
+    $tftpOk = $true
+    Ok "TFTP  $tftpBase  (pid $($servers[-1].Id), UDP 69)"
 }
 
 try {
@@ -622,15 +630,15 @@ try {
         Ok "前 $headLen 字节一致（设备没有 md5sum，用逐字节比对）"
     }
 
-    # 8) 解锁（只在必要时）+ 取 mtd 工具（擦写都要它）
-    Step '下载 mtd 工具'
-    $r = Invoke-Fetch 'mtd' -Exec -TimeoutSec 120
-    if ($r.Code -ne 0) { Bad 'mtd 下载失败'; throw '下载失败' }
-
+    # 8) 解锁（只在必要时）+ 取 mtd 工具
     if ($needUnlock) {
         Step '下载 mtd-rw.ko'
         $r = Invoke-Fetch 'mtd-rw.ko' -TimeoutSec 120
         if ($r.Code -ne 0) { Bad 'mtd-rw.ko 下载失败'; throw '下载失败' }
+
+        Step '下载 mtd'
+        $r = Invoke-Fetch 'mtd' -Exec -TimeoutSec 120
+        if ($r.Code -ne 0) { Bad 'mtd 下载失败'; throw '下载失败' }
 
         Step 'insmod mtd-rw.ko i_want_a_brick=1'
         $r = Invoke-Dev 'cd /tmp && insmod mtd-rw.ko i_want_a_brick=1 2>&1; echo rc=$?' -TimeoutSec 60
@@ -654,36 +662,26 @@ try {
         Warn '注意：/sys/block/mtdblock0/ro 仍会显示 1，这是正常的，别拿它判断'
     }
 
-    # 9) 写入
+    # 9) 写入 —— 严格按 OpenWrt wiki 的两种写法
     Step '写入 mtd0'
-    # 实测（-Probe）：这个 mtd 只认 /dev/mtd0 全路径，传 mtd0 / boot 都报
-    # "Could not open mtd device"。加 -f 跳过 trx 校验（我们的镜像是裸 U-Boot，不是 TRX）。
-    $pre = Invoke-Dev 'cd /tmp && ./mtd 2>&1' -TimeoutSec 60
-    if ($pre.Output -notmatch 'Usage: mtd') {
-        Warn "mtd 工具跑不起来: $((($pre.Output -split "`n") | Where-Object { $_.Trim() } | Select-Object -First 3) -join ' / ')"
-        Warn '改用 dd 直写 /dev/mtdblock0（mtdblock 会按块擦写，慢但可用）'
-        $candidates = @()
+    if ($needUnlock) {
+        # wiki: wget mtd && chmod +x mtd && ./mtd write uboot_mx64 /dev/mtd0
+        $pre = Invoke-Dev 'cd /tmp && ./mtd 2>&1' -TimeoutSec 60
+        if ($pre.Output -match 'Usage: mtd') {
+            Ok 'mtd 工具可用'
+            $r = Invoke-Dev "cd /tmp && ./mtd write /tmp/$target /dev/mtd0" -TimeoutSec 900
+        } else {
+            Warn "mtd 跑不起来: $((($pre.Output -split "`n") | Where-Object { $_.Trim() } | Select-Object -First 2) -join ' / ')"
+            Warn '退回 dd 写 /dev/mtdblock0'
+            $r = Invoke-Dev "dd if=/tmp/$target of=/dev/mtdblock0" -TimeoutSec 900
+        }
     } else {
-        Ok 'mtd 工具可用'
-        $candidates = @('/dev/mtd0', 'mtd0', 'boot')
-    }
-
-    $wrote = $false
-    foreach ($arg in $candidates) {
-        if (-not $arg) { continue }
-        Note "  试 ./mtd -f write /tmp/$target $arg"
-        $r = Invoke-Dev "cd /tmp && ./mtd -f write /tmp/$target $arg 2>&1" -TimeoutSec 900
-        ($r.Output -split "`n") | Where-Object { $_.Trim() } | Select-Object -Last 4 | ForEach-Object { Note ("    " + $_.Trim()) }
-        if ($r.Code -eq 0) { Ok "写入完成（mtd $arg）"; $wrote = $true; break }
-        Warn "  这个参数名不行（exit $($r.Code)），换下一个"
-    }
-    if (-not $wrote) {
-        Warn 'mtd 写不进去，改用 dd'
+        # wiki: dd if=uboot_mx64 of=/dev/mtdblock0（mtd0 本来就可写时）
         $r = Invoke-Dev "dd if=/tmp/$target of=/dev/mtdblock0" -TimeoutSec 900
-        ($r.Output -split "`n") | Where-Object { $_.Trim() } | Select-Object -Last 3 | ForEach-Object { Note ("  " + $_.Trim()) }
-        if ($r.Code -ne 0) { throw '写入失败' }
-        Ok '写入完成（dd）'
     }
+    ($r.Output -split "`n") | Where-Object { $_.Trim() } | Select-Object -Last 4 | ForEach-Object { Note ("  " + $_.Trim()) }
+    if ($r.Code -ne 0) { Bad "写入失败 (exit $($r.Code))"; throw '写入失败' }
+    Ok '写入完成'
 
     # 10) 回读比对
     Step '回读 mtd0 前 512 字节比对'
