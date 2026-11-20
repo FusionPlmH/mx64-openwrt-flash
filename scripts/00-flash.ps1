@@ -440,14 +440,44 @@ try {
     Ok "将刷入 $target ($localSize 字节, md5 $localMd5)"
 
     if ($Check) {
+        $fitName = if ($variant -eq 'a0') { 'openwrt-bcm53xx-generic-meraki_mx64-a0-initramfs.bin' }
+                   else { 'openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin' }
+        $transName = if ($variant -eq 'a0') { 'openwrt-bcm5862x-generic-meraki_mx64a0-initramfs-kernel.bin' }
+                     else { 'openwrt-bcm5862x-generic-meraki_mx64-initramfs-kernel.bin' }
+        $sysPat = if ($variant -eq 'a0') { 'openwrt-*-meraki_mx64-a0-squashfs.sysupgrade.bin' }
+                  else { 'openwrt-*-meraki_mx64-squashfs.sysupgrade.bin' }
+        $sysCand = Get-ChildItem (Join-Path $filesDir $sysPat) -ErrorAction SilentlyContinue |
+                   Sort-Object Name -Descending | Select-Object -First 1
+        $sysName = if ($sysCand) { $sysCand.Name } else { "（files/ 里没有 $sysPat）" }
+        $needTrans = ($target -eq 'uboot_mx64_small')
+
         Write-Host ''
         Rule 'DarkYellow'
         Write-Host '  -Check：结论如下，什么都没写' -ForegroundColor Yellow
-        KeyVal 'SoC'    $(if ($variant -eq 'a0') { 'A0' } elseif ($variant -eq 'b0') { 'B0+' } else { '未知' })
-        KeyVal 'mtd0'   ("0x{0} ({1} 字节)" -f $mtd0Hex, $mtd0Size)
-        KeyVal 'U-Boot' $target
-        KeyVal '解锁'   $(if ($needUnlock) { '需要（mtd-rw.ko）' } else { '不需要' })
-        KeyVal 'sysupgrade 镜像' $(if ($variant -eq 'a0') { '*-a0-squashfs.sysupgrade.bin' } else { '*-squashfs.sysupgrade.bin' })
+        Rule 'DarkYellow'
+        KeyVal 'SoC'       $(if ($variant -eq 'a0') { 'A0' } elseif ($variant -eq 'b0') { 'B0+' } else { '未知（按 B0+ 处理）' })
+        KeyVal 'mtd0'      ("0x{0} ({1} 字节)" -f $mtd0Hex, $mtd0Size)
+        KeyVal 'Target'    $target
+        KeyVal 'Unlock'    $(if ($needUnlock) { '需要（先 insmod mtd-rw.ko，再用 mtd write）' } else { '不需要（直接 dd）' })
+        if ($needTrans) {
+            KeyVal 'Transition' "需要 -> $transName"
+            KeyVal 'Initramfs'  '先用过渡固件换 1 MiB 布局，之后不需要 FIT initramfs'
+        } else {
+            KeyVal 'Transition' '不需要（mtd0 >= 1 MiB，直接引导 FIT initramfs）'
+            KeyVal 'Initramfs'  $fitName
+        }
+        KeyVal 'Sysupgrade'  $sysName
+        Write-Host ''
+        Write-Host '  刷完之后的路径：' -ForegroundColor White
+        if ($needTrans) {
+            Note '1) 过渡固件 openwrt-bcm5862x-...-initramfs-kernel.bin（SPIM，bootbk）'
+            Note '2) 里面跑 30-write-uboot-from-openwrt.sh 换成 1 MiB 布局'
+            Note '3) sysupgrade（不要单独重启去测 U-Boot）'
+        } else {
+            Note '1) 重启 -> U-Boot 自动 UBI->USB->TFTP，拉 FIT initramfs（bootm）'
+            Note '2) scp sysupgrade 到 /tmp'
+            Note '3) ssh 里 sysupgrade -n'
+        }
         Rule 'DarkYellow'
         Send-Line $stream 'exit'
         Start-Sleep -Milliseconds 300
