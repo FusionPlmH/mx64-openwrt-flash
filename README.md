@@ -11,7 +11,7 @@
 | 问题 | 答案 |
 |---|---|
 | 第一次装 U-Boot 要按 reset 吗？ | **要**。原厂固件只有 diagnostic mode 才给 shell，没有别的入口（这部分没法绕）。 |
-| 之后刷 initramfs 还要按 reset 吗？ | **不用**，只要用的是本仓库的 `uboot_ng.bin`。引导顺序是 UBI → USB → TFTP，前一个失败自动试下一个，全程不碰按键。 |
+| 之后刷 initramfs 还要按 reset 吗？ | **不用**，只要用的是本仓库的 `uboot_ng.bin`。引导顺序是 UBI → TFTP → USB（USB 默认关闭），前一个失败自动试下一个，全程不碰按键。 |
 | 能不能一条命令刷完？ | 能。`scripts\00-flash.ps1` 在 PC 上起好服务并 telnet 注入 `one-shot-diag.sh`，设备端检测/校验/写入/回读全自动。 |
 
 ## 目录内容
@@ -186,49 +186,76 @@ cd /tmp && wget http://192.168.1.2:8000/20-install-uboot.sh && sh 20-install-ubo
 6. 换完 U-Boot 后第一次启动要重做 Shmoo 校准，会**很久**（几分钟）。橙白闪说明 UBI 引导失败：
    这时用 U 盘引导 initramfs 重装 OpenWrt，**不要再刷 U-Boot**。
 
-## 7. 启动 OpenWrt initramfs
+## 7. 启动 initramfs / 过渡固件（默认走 TFTP，不用按 reset）
 
-有两种方式，**都不需要按 reset**（前提是已经刷了 `uboot_ng.bin`）。
+刷完 `uboot_ng.bin` 之后的默认行为：`enable_tftp_boot=1`、`enable_usb_boot=0`，
+引导顺序是
 
-### 7a. 从 U 盘
+```
+UBI 里能起内核        -> 直接起 OpenWrt（不碰网络）
+UBI 起不来（空/坏）   -> 自动 tftp_boot（网络）
+TFTP 也没有           -> （USB 默认关）-> meraki 原厂分区（也关）
+```
 
-1. U 盘（根目录有 `openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin`）插好；
-2. 上电。`uboot_ng.bin` 的引导顺序是：
+也就是说：**NAND 是空的就自己上网找镜像，不按 reset、不插 U 盘**。
 
-   ```
-   UBI 里能起内核        -> 直接起 OpenWrt，不碰 U 盘/网络
-   UBI 起不来（空/坏）   -> 自动 usbload（U 盘，3 次尝试，2 条总线，2 个文件名）
-   还是不行              -> 自动 tftp_boot（网络）
-   ```
+### 7a. 走 TFTP（默认方式）
 
-   所以刷完 U-Boot 第一次上电、NAND 里还没有 OpenWrt 时，它会**自己**去找 U 盘/网络，
-   不用按 reset，也不用按键；
-3. 白灯闪 3 下 = 开始尝试 USB；灯常橙 = 引导中；之后绿闪（先快后慢）→ 绿色常亮 = 起来了；
-4. 起不来就删掉文件重拷一次，或换 U 盘 / 删掉 U 盘上其它分区。
-
-### 7b. 走 TFTP（不用 U 盘）
-
-PC 上（TFTP 需要管理员权限）：
+PC 上（TFTP 需要管理员权限 / root）：
 
 ```powershell
 python scripts\70-tftp-server.py            # 服务 files/，UDP 69
 ```
 
-设备上电后什么都不用按；如果 UBI 和 USB 都没成功，它会用
-`ipaddr=192.168.1.10 / serverip=192.168.1.2` 自己 `tftp_boot`。
-想手动来，就在 `BOOTDELAY` 3 秒内按任意键停在提示符，然后：
+PC 网卡设成 `192.168.1.2/24`，网线接 LAN 口，然后**直接上电**。
+
+`tftp_boot` 会按顺序试三个文件名，第一个能加载的就引导（`bootimg` 按镜像头判断类型）：
+
+| 顺序 | 文件名 | 类型 |
+|---|---|---|
+| 1 | `${tftp_file}`（你自己设的，可选） | 任意 |
+| 2 | `openwrt-bcm53xx-generic-meraki_mx64[-a0]-initramfs.bin` | FIT → `bootm` |
+| 3 | `openwrt-bcm5862x-generic-meraki_mx64[a0]-initramfs-kernel.bin` | SPIM 过渡固件 → `bootbk` |
+
+所以 `files/` 里的东西**原样放在 TFTP 根目录**就行，不需要改名。
+A0/B0+ 由 `config_dts` 自动决定用哪套文件名。
+
+想手动控制（上电后 3 秒内按任意键停在提示符）：
 
 ```
 setenv ipaddr 192.168.1.10
 setenv serverip 192.168.1.2
+setenv ethaddr <你标签上的 MAC>
 tftp_boot
 ```
 
-`tftp_boot` 会按 SoC 版本选文件名，拉下来后交给 `bootimg`（FIT 走 `bootm`，
-Meraki 的 SPIM 过渡固件走 `bootbk`）。完整命令见 `scripts/90-uboot-tftp.txt`。
+只想刷某一个固定文件：
 
-关掉自动网络尝试：`setenv enable_tftp_boot 0; saveenv`
-（同理 `enable_usb_boot 0` 关 U 盘、`disable_ubi_boot 1` 跳过 UBI）。
+```
+setenv tftp_file openwrt-bcm5862x-generic-meraki_mx64-initramfs-kernel.bin
+tftp_boot
+```
+
+开关：
+
+```
+setenv enable_tftp_boot 0     # 不自动走网络
+setenv enable_usb_boot 1      # 把 U 盘路径打开（默认关）
+setenv disable_ubi_boot 1     # 跳过 UBI，直接走 TFTP/USB
+saveenv
+```
+
+### 7b. 从 U 盘（需要先打开 USB）
+
+```
+setenv enable_usb_boot 1
+setenv enable_tftp_boot 0
+saveenv
+```
+
+然后在 U 盘根目录放 `openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin`
+（A0 用 `-a0-` 那个名字）。白灯闪 3 下 = 开始尝试 USB；灯常橙 = 引导中；
+之后绿闪（先快后慢）→ 绿色常亮 = 起来了。
 
 ## 8. 备份原厂分区（强烈建议，先备份再 sysupgrade）
 
@@ -276,15 +303,15 @@ cd /tmp && wget http://192.168.1.2:8000/60-reclaim-space.sh && sh 60-reclaim-spa
 
 ## 11. 用本项目的 U-Boot（`uboot_ng.bin`）时的额外能力
 
-`uboot_ng.bin` 是 `mx64-uboot-ng` 的构建产物（GCC 5.4，597,636 B），需要 **1 MiB** 的 boot 分区，
+`uboot_ng.bin` 是 `mx64-uboot-ng` 的构建产物（GCC 5.4，598,172 B），需要 **1 MiB** 的 boot 分区，
 特性：
 
 | 命令 | 作用 |
 |---|---|
 | `mx64init` | 初始化外设 + 读 reset 键（开机自动执行） |
-| `usbload` | 从 U 盘 FAT 里按文件名列表尝试引导 |
+| `tftp_boot` | TFTP 拉镜像并 `bootimg`：先试 `${tftp_file}`，再试 FIT initramfs，再试 SPIM 过渡固件 |
+| `usbload` | 从 U 盘 FAT 里按文件名列表尝试引导（默认关闭，`setenv enable_usb_boot 1` 打开） |
 | `bootimg <addr> [part]` | 按镜像头自动选择 `bootm`（FIT/uImage）或 `bootbk`（Meraki SPIM 过渡固件） |
-| `tftp_boot` | TFTP 拉 initramfs 并 `bootimg`（`ipaddr=192.168.1.10`，`serverip=192.168.1.2`） |
 | **`flash_uboot <file> <分区大小hex> confirm`** | **TFTP 取新 U-Boot → 校验 → 擦/写 mtd0 → 回读 CRC 比对**，从此不用 diag 模式 |
 | `bootbk <addr> <part>` | 启动 Meraki bootkernel（校验头部 CRC32） |
 | `mx64info` | 打印版本、SoC、reset 状态、环境变量 |
@@ -318,16 +345,18 @@ reset
 ### LED 码
 
 琥珀=电源常亮；白灯 3 次连闪=开始 USB 尝试，1 闪=没检测到 U 盘，2 闪=有盘但没找到/加载不了文件，
-3 闪=文件加载了但没引导成功。
+3 闪=文件加载了但没引导成功。**这些只在 `enable_usb_boot=1` 时才会出现**（默认是关的），
+默认走 TFTP 时灯只会常橙 → 绿闪 → 绿常亮。
 
 ### 引导顺序（这就是"不用按 reset"的原因）
 
 ```
-run soc_dtscheck; mx64init; run ubi_checkboot; run usb_checkboot; run tftp_checkboot; run meraki_checkboot
+run soc_dtscheck; mx64init; run ubi_checkboot; run tftp_checkboot; run usb_checkboot; run meraki_checkboot
 ```
 
-UBI → USB → TFTP 依次尝试，前一个失败才走下一个。完整命令清单见
-[scripts/90-uboot-tftp.txt](scripts/90-uboot-tftp.txt)。
+UBI → **TFTP** → USB → meraki 依次尝试，前一个失败才走下一个。
+默认 `enable_tftp_boot=1`、`enable_usb_boot=0`，所以空 NAND 会自己走网络。
+完整命令清单见 [scripts/90-uboot-tftp.txt](scripts/90-uboot-tftp.txt)。
 
 TFTP 恢复：
 
