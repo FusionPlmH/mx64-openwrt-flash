@@ -178,7 +178,7 @@ Write-Host '  这次的配置' -ForegroundColor White
 KeyVal 'Device'     "$DeviceIp (telnet 23)"
 KeyVal 'Server'     "$ServerIp  (diag 下载走 $Transport)"
 KeyVal 'Boot'       $(if ($NoTftp) { 'U 盘冷启动（-NoTftp，不起 TFTP）' } elseif ($BootMedia -eq 'tftp') { 'TFTP 自动取 initramfs（不提示 U 盘）' } else { 'U 盘 + TFTP 双通道（U-Boot 自己选，先 USB 再 TFTP）' })
-KeyVal 'U-Boot'     $(if ($Uboot -eq 'ng') { 'uboot_ng.bin（本项目，需 1 MiB 分区）' } else { 'clayface uboot_mx64 / uboot_mx64_small（按 mtd0 自动选）' })
+KeyVal 'U-Boot'     $(if ($Uboot -eq 'ng') { 'uboot_ng.bin（本项目，需 1 MiB 分区）' } else { 'clayface uboot_mx64（需 1 MiB 分区）' })
 KeyVal 'Sysupgrade' $(if ($SkipSysupgrade) { '跳过' } elseif ($SysupgradeFile) { $SysupgradeFile } else { '自动选最新的（按 A0/B0+ 匹配）' })
 KeyVal 'Backup'     '跳过（默认）。要备份见 README「可选步骤」，在 initramfs 里用 scp 拉'
 KeyVal 'Mode'       $(if ($Check) { '仅检测（含 mtd 工具验证，不写 NAND）' } elseif ($Probe) { '仅探测 mtd 工具（不擦不写）' } elseif ($DryRun) { '只看计划' } else { '真刷' })
@@ -667,17 +667,12 @@ try {
     }
 
     # 5) 决定刷哪个（PC 侧决策）
-    $ngSize = (Get-Item (Join-Path $filesDir 'uboot_ng.bin')).Length
-    if ($Uboot -eq 'ng') {
-        if ($mtd0Size -lt 1048576) {
-            Warn "mtd0 只有 0x$mtd0Hex，uboot_ng.bin 有 $ngSize 字节，装不下 -> 改用 uboot_mx64_small"
-            $target = 'uboot_mx64_small'
-        } else {
-            $target = 'uboot_ng.bin'
-        }
-    } else {
-        if ($mtd0Size -lt 1048576) { $target = 'uboot_mx64_small' } else { $target = 'uboot_mx64' }
+    if ($mtd0Size -lt 1048576) {
+        Bad "mtd0 只有 0x$mtd0Hex（$mtd0Size 字节），装不下 1 MiB 版 U-Boot"
+        Note '本工具只覆盖 mtd0 = 0x100000 的机器；512 KiB 的机器请按 OpenWrt wiki 的过渡固件流程处理'
+        throw 'mtd0 太小（512 KiB）'
     }
+    $target = if ($Uboot -eq 'ng') { 'uboot_ng.bin' } else { 'uboot_mx64' }
     $localPath = Join-Path $filesDir $target
     $localSize = (Get-Item $localPath).Length
     $localMd5 = (Get-FileHash $localPath -Algorithm MD5).Hash.ToLower()
@@ -692,14 +687,11 @@ try {
         # -Check 顺带跑 mtd 工具验证（原 -Probe 的内容），仍然不擦不写
         $mtdTest = Test-MtdTool
 
-        $transName = if ($variant -eq 'a0') { 'openwrt-bcm5862x-generic-meraki_mx64a0-initramfs-kernel.bin' }
-                     else { 'openwrt-bcm5862x-generic-meraki_mx64-initramfs-kernel.bin' }
         $sysPat = if ($variant -eq 'a0') { 'openwrt-*-meraki_mx64-a0-squashfs.sysupgrade.bin' }
                   else { 'openwrt-*-meraki_mx64-squashfs.sysupgrade.bin' }
         $sysCand = Get-ChildItem (Join-Path $filesDir $sysPat) -ErrorAction SilentlyContinue |
                    Sort-Object Name -Descending | Select-Object -First 1
         $sysName = if ($sysCand) { $sysCand.Name } else { "（files/ 里没有 $sysPat）" }
-        $needTrans = ($target -eq 'uboot_mx64_small')
 
         $mtdToolTxt =
             if (-not $mtdTest.Downloaded) { '没验证（mtd 下载失败）' }
@@ -720,25 +712,13 @@ try {
         KeyVal 'MtdTool'   $mtdToolTxt
         KeyVal 'Target'    $target
         KeyVal 'Unlock'    $(if (-not $needUnlock) { '不需要（直接 dd）' } elseif ($rwLoaded) { '已解锁（mtd_rw 已在运行，直接 mtd write）' } else { '需要（insmod mtd-rw.ko + mtd write）' })
-        if ($needTrans) {
-            KeyVal 'Transition' "需要 -> $transName"
-            KeyVal 'Initramfs'  '先用过渡固件换 1 MiB 布局，之后不需要 FIT initramfs'
-        } else {
-            KeyVal 'Transition' '不需要（mtd0 >= 1 MiB，直接引导 FIT initramfs）'
-            KeyVal 'Initramfs'  $fitName
-        }
+        KeyVal 'Initramfs'  $fitName
         KeyVal 'Sysupgrade'  $sysName
         Write-Host ''
         Write-Host '  刷完之后的路径：' -ForegroundColor White
-        if ($needTrans) {
-            Note '1) 过渡固件 openwrt-bcm5862x-...-initramfs-kernel.bin（SPIM，bootbk）'
-            Note '2) 里面跑 30-write-uboot-from-openwrt.sh 换成 1 MiB 布局'
-            Note '3) sysupgrade（不要单独重启去测 U-Boot）'
-        } else {
-            Note '1) 拔电 -> 插 U 盘 -> 上电（U-Boot 走 USB，白灯闪三下后加载）'
-            Note '2) scp sysupgrade 到 /tmp'
-            Note '3) ssh 里 sysupgrade -n'
-        }
+        Note '1) 拔电 -> 插 U 盘 -> 上电（U-Boot 走 USB，白灯闪三下后加载）'
+        Note '2) scp sysupgrade 到 /tmp'
+        Note '3) ssh 里 sysupgrade -n'
         Rule 'DarkYellow'
         Send-Line $stream 'exit'
         Start-Sleep -Milliseconds 300

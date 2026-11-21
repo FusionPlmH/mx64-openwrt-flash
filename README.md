@@ -16,11 +16,11 @@ busybox 1.7.2 连 `sed` / `awk` 都没有。
 | 你的 mtd0 | 刷的 U-Boot | 引导进 OpenWrt 用 |
 |---|---|---|
 | `00100000`（1 MiB，**大多数机器**） | `uboot_ng.bin`（本项目）或 `uboot_mx64`（clayface） | `openwrt-bcm53xx-generic-meraki_mx64[-a0]-initramfs.bin`（FIT，`bootm`） |
-| `00080000`（512 KiB） | `uboot_mx64_small` | `openwrt-bcm5862x-generic-meraki_mx64[a0]-initramfs-kernel.bin`（SPIM，`bootbk`）——只用来换成 1 MiB 布局 |
 
-两种 initramfs 是完全不同的容器，不是同一东西的两个版本：
-FIT（首字节 `d0 0d fe ed`）是正常的 OpenWrt RAM 系统，之后 sysupgrade 进 NAND；
-SPIM（`53 50 49 4d`）只有 512 KiB 老机器要，里面带 1 MiB 版 `uboot_mx64`。
+本工具只覆盖 **mtd0 = 1 MiB** 的机器；`00080000`（512 KiB）的机器不在支持范围内，
+脚本会在检测到它时直接停下。
+
+引导用的 initramfs 是 FIT 容器（首字节 `d0 0d fe ed`），就是正常的 OpenWrt RAM 系统，之后 sysupgrade 进 NAND。
 
 A0 / B0+ 由脚本读 `devmem 0x18000000` 自动判断（`0x3F00`–`0x3F03` 为 A0），镜像选错内核起不来。
 
@@ -72,7 +72,7 @@ TFTP 覆盖同样的路径，**不插 U 盘也能起**；U-Boot 顺序是 UBI �
 - 单个分区、**FAT16/FAT32**（MBR），文件放**分区根目录**
 - 文件名必须一字不差：B0+ 用 `openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin`，
   A0 用 `openwrt-bcm53xx-generic-meraki_mx64-a0-initramfs.bin`
-- `powershell -File scripts\02-copy-to-usb.ps1 -Drive E:\` 会拷过去并校验
+- 把 `files\` 里对应的那个文件**手动拷到 U 盘根目录**（约 6 MB，其他文件不用拷，改名就找不到）
 
 U-Boot 只 `fatload` + `bootm`，从不写 NAND；sysupgrade 放 U 盘上不会被自动安装。
 
@@ -112,14 +112,6 @@ sync
 
 然后**拔电源**（不要 `reboot`）→ 插 U 盘或用 PC 上的 TFTP → 上电。
 
-## 512 KiB 机器（过渡固件换成 1 MiB 布局）
-
-1. 把 `openwrt-bcm5862x-generic-meraki_mx64-initramfs-kernel.bin`（A0 用 `..._mx64a0-...`）放进 U 盘或 TFTP 根目录
-2. 按住 reset 上电，引导进过渡固件（`uboot_mx64_small` 是按键触发的）
-3. `ssh root@192.168.1.1`，跑 `scripts/30-write-uboot-from-openwrt.sh`
-   （会先探 mtd0 可写性；出厂带写保护的机器在 OpenWrt 下写不了，只能走「重新刷 U-Boot」那节）
-4. **不要重启**，直接 sysupgrade
-
 ## sysupgrade 装进 NAND
 
 自动流程第 6 阶段会做，手动时：
@@ -151,7 +143,26 @@ wget http://192.168.1.2:8000/60-reclaim-space.sh && sh 60-reclaim-space.sh
 
 ## 进了 OpenWrt 之后重新刷 U-Boot
 
-OpenWrt 下 mtd0 是 DTS 只读的，diag 也没了。让 U-Boot 自己刷自己：
+OpenWrt 下 mtd0 是 DTS 只读的，diag 也没了，只能让 U-Boot 自己刷自己。一条命令搞定：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\05-reflash-uboot.ps1
+powershell -ExecutionPolicy Bypass -File scripts\05-reflash-uboot.ps1 -UbootFile files\uboot_mx64   # 换镜像
+powershell -ExecutionPolicy Bypass -File scripts\05-reflash-uboot.ps1 -DryRun                        # 只看计划
+```
+
+脚本做的事：
+
+1. `mkenv.py` 生成一份把 `flash_uboot` 塞进 `bootcmd` 的环境变量块，`scp` 上去写进 `mtd3`（`u-boot-env`）
+2. 起 TFTP（`70-tftp-server.py`），提示你拔电再上电
+3. U-Boot 自己取镜像 → 校验 → 擦写 mtd0 → 回读 CRC，然后继续正常启动
+4. 设备回来后核对 mtd0 前 N 字节的 md5，确认真的写进去了
+5. 把 `bootcmd` 恢复成默认再写一次 mtd3 —— 不会每次开机都重刷
+
+任一步不满足，U-Boot 会打印 `TFTP failed, nothing was written` 跳过，不会留下半写的 mtd0。
+
+<details>
+<summary>不用脚本时的手动做法</summary>
 
 ```powershell
 python tools\mkenv.py files\uboot_ng.bin files\uboot-env-flash.bin `
@@ -166,13 +177,11 @@ dd if=/tmp/uboot-env-flash.bin of=/dev/mtd3 bs=4096
 sync
 ```
 
-让 `python scripts\70-tftp-server.py` 跑着、`uboot_ng.bin` 放在服务目录里，然后断电重启。
-U-Boot 会 TFTP 取镜像 → 校验 → 擦写 mtd0 → 回读 CRC；任一步不满足就打印
-`TFTP failed, nothing was written` 跳过，不会留下半写的 mtd0。
+让 `python scripts\70-tftp-server.py` 跑着、`uboot_ng.bin` 放在服务目录里，断电重启。
+刷完用 `mkenv.py` 不带 `bootcmd=` 再生成一份（或直接用 `files\uboot-env.bin`）写回 mtd3，
+否则每次开机都会重刷。`mtd` 工具只认 label（`u-boot-env`），传 `mtd3` 会报错。
 
-刷完把 `bootcmd` 改回默认（去掉 `flash_uboot`），否则每次开机都会重刷。
-其他环境变量（`ipaddr` / `serverip` / `config_dts`）同样用 `tools\mkenv.py` 生成后写 mtd3，
-`files/uboot-env.bin` 就是默认那份。`mtd` 工具只认 label（`u-boot-env`），传 `mtd3` 会报错。
+</details>
 
 ## 确认设备现在处于哪一步
 
@@ -182,47 +191,23 @@ df -h /overlay                # 有 /overlay 且几百 MB = sysupgrade 过了
 ubinfo -a                     # 有 rootfs_data 卷 = 已装好
 ```
 
-## 故障排查
-
-| 现象 | 处理 |
-|---|---|
-| `192.168.1.1:23` 连不上 | 没进 diag（正常启动时 LAN 是 `192.168.0.1`）；网线插 LAN1-4 不是 WAN；进 diag 要 20~30 秒 |
-| 白灯闪两下后一直橙 | diag Linux 没起来，断电重试 2-3 次；仍不行接串口 J1（115200 8N1） |
-| `wget` 404 | HTTP 服务目录不对，或文件名打错 |
-| `wget: can't open 'xxx': File exists` | 原厂 `wget` 不覆盖，先 `rm -f` 再下 |
-| `mtd-rw.ko` insmod 报错 | 内核不匹配，看 dmesg 的 vermagic / 符号版本 |
-| insmod 报 `File exists` | 之前已加载，**不是失败**；看 `/proc/modules` 有没有 `mtd_rw` |
-| 解锁后 `ro` 还是 1 | **正常**。判据是 `/proc/modules` 有 `mtd_rw` 或 dmesg 有 `setting writeable flag` |
-| `Could not open mtd device: mtd0` | `mtd` 只认 `/dev/mtd0` 全路径，不认 `mtd0` 或 label |
-| 回读和镜像不一致 | **不要断电重启**，重跑脚本再写一次 |
-| 写完 mtd0 设备不回来 | 别用 `reboot`，拔电源冷启动 + 插 U 盘 |
-| TFTP 有请求但没 `done` | 传输中断：查防火墙（公用网络会拦）、丢包、网线；重试即可，NAND 没被动过 |
-| 插了 U 盘白灯一次都不闪 | U-Boot 没走到 `usb_boot`：确认 FAT16/FAT32 单分区、文件名一字不差，换个 U 盘；仍不行接串口 |
-| 白灯闪三下后又常亮橙 | `fatload` 成功但 `bootm` 失败——文件名对、内容不对（比如放成了 sysupgrade） |
-| 装完只有 ~370 MiB 可用 | 见「释放原厂占用的 flash」 |
-| 进了系统却反复掉回 USB/TFTP | `config_dts` 选错（A0/B0+ 镜像不匹配），重刷对应的 sysupgrade |
-| 首次冷启动 U 盘能起、TFTP 完全没动静 | 先在 U-Boot 里 `printenv enable_tftp_boot`，缺了就 `setenv enable_tftp_boot 1; saveenv` |
-
 ## 目录内容
 
 ```
 files/                    刷机用到的全部文件（SHA256SUMS 逐个校验）
   uboot_ng.bin            本项目 U-Boot v6（598,488 B，需 1 MiB 分区）
   uboot_mx64               clayface U-Boot（587,312 B，1 MiB 分区）
-  uboot_mx64_small         clayface U-Boot（524,288 B，512 KiB 分区）
   uboot-env.bin            默认 U-Boot 环境变量块（config_dts=config@4）
   mtd-rw.ko                mtd0 写保护解锁（只对原厂 2.6.36 内核有效）
   mtd                      busybox mtd 工具（解锁后用 mtd write）
   *-initramfs.bin          FIT RAM 系统（B0+ / A0）
-  *-initramfs-kernel.bin   SPIM 过渡固件（只有 512 KiB 机器要）
   *-sysupgrade.bin         装进 NAND 的系统（B0+ / A0）
 scripts/
   00-flash.ps1             一键刷机（PC 驱动 telnet，全自动）
   01-serve-http.ps1        只起 HTTP 服务
   70-tftp-server.py        只读 TFTP 服务器（给 U-Boot 用）
-  02-copy-to-usb.ps1       拷 files/ 到 U 盘并校验
   03-fetch-backup.ps1      把设备 /tmp/backup 拉回 PC
-  30-write-uboot-from-openwrt.sh  512 KiB → 1 MiB 布局切换
+  05-reflash-uboot.ps1     OpenWrt 里重新刷 U-Boot（TFTP + flash_uboot）
   40-backup-flash.sh       OpenWrt 里备份原厂分区（可选）
   50-sysupgrade.sh         OpenWrt 里执行 sysupgrade
   60-reclaim-space.sh      删原厂 UBI 卷，扩 rootfs_data
