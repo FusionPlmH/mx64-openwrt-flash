@@ -2,7 +2,7 @@
 #  MX64 一键刷机（全部逻辑在 PC 侧）
 #
 #    powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1              # 默认：HTTP 下载 + U 盘冷启动
-#    powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Check      # 只看结论
+#    powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Check      # 只看结论（含 mtd 工具验证）
 #    powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -DryRun     # 只看计划
 #
 #  设备上不落任何脚本：PC 通过 telnet 一条一条发原始命令（cat / wget / dd ...），
@@ -181,7 +181,7 @@ KeyVal 'Boot'       $(if ($NoTftp) { 'U 盘冷启动（-NoTftp，不起 TFTP）'
 KeyVal 'U-Boot'     $(if ($Uboot -eq 'ng') { 'uboot_ng.bin（本项目，需 1 MiB 分区）' } else { 'clayface uboot_mx64 / uboot_mx64_small（按 mtd0 自动选）' })
 KeyVal 'Sysupgrade' $(if ($SkipSysupgrade) { '跳过' } elseif ($SysupgradeFile) { $SysupgradeFile } else { '自动选最新的（按 A0/B0+ 匹配）' })
 KeyVal 'Backup'     '跳过（默认）。要备份见 README「可选步骤」，在 initramfs 里用 scp 拉'
-KeyVal 'Mode'       $(if ($Check) { '仅检测（不写 NAND）' } elseif ($Probe) { '仅探测 mtd 工具（不擦不写）' } elseif ($DryRun) { '只看计划' } else { '真刷' })
+KeyVal 'Mode'       $(if ($Check) { '仅检测（含 mtd 工具验证，不写 NAND）' } elseif ($Probe) { '仅探测 mtd 工具（不擦不写）' } elseif ($DryRun) { '只看计划' } else { '真刷' })
 
 if ($DryRun) {
     Write-Host ''
@@ -513,6 +513,51 @@ try {
         Invoke-Dev "cd /tmp && rm -f $Name && wget $httpBase/$Name$tail" -TimeoutSec $TimeoutSec
     }
 
+    # 验证设备上的 mtd 工具：能不能跑、unlock 认哪种写法、dd 直读通不通。
+    # 只清保护位和读数据，不擦不写 NAND；-Check 和 -Probe 共用。
+    function Test-MtdTool {
+        $res = @{ Downloaded = $false; RunOk = $false; UnlockArg = ''; DdOk = $false; DdHead = '' }
+
+        Step '下载 mtd 工具'
+        $r = Invoke-Fetch 'mtd' -Exec -TimeoutSec 120
+        if ($r.Code -ne 0) {
+            Warn "mtd 下载失败: $((($r.Output -split "`n") | Where-Object { $_.Trim() }) -join ' | ')"
+            return $res
+        }
+        $res.Downloaded = $true
+        Ok 'mtd 已下载'
+
+        Step './mtd（确认能跑起来，动态库齐全）'
+        $u = Invoke-Dev 'cd /tmp && ./mtd 2>&1' -TimeoutSec 60
+        ($u.Output -split "`n") | Where-Object { $_.Trim() } | ForEach-Object { Note ("  " + $_.Trim()) }
+        $res.RunOk = ($u.Output -match 'Usage: mtd')
+        if ($res.RunOk) { Ok 'mtd 可以执行' } else { Bad 'mtd 跑不起来（可能是 uClibc 版本/AArch 不对）' }
+
+        # unlock 只是清 flash 的保护位，不擦不写，拿来试参数名最安全
+        Step '试参数名：./mtd unlock <arg>'
+        foreach ($arg in @('/dev/mtd0', 'mtd0', 'boot', '__nope__')) {
+            $p = Invoke-Dev "cd /tmp && ./mtd unlock $arg 2>&1" -TimeoutSec 60
+            $txt = (($p.Output -split "`n") | Where-Object { $_.Trim() }) -join ' | '
+            if ($p.Output -match 'Could not open mtd device') {
+                Warn "  $arg -> $txt（不认这个写法）"
+            } else {
+                Ok "  $arg -> $txt"
+                if (-not $res.UnlockArg) { $res.UnlockArg = $arg }
+            }
+        }
+
+        Step 'dd 直读 /dev/mtd0（备用通路）'
+        $d = Invoke-Dev 'dd if=/dev/mtd0 bs=4 count=1 2>&1' -TimeoutSec 60 -Binary
+        if ($d.Code -eq 0 -and $d.Bytes.Length -ge 4) {
+            $res.DdOk = $true
+            $res.DdHead = (($d.Bytes[0..3] | ForEach-Object { '{0:x2}' -f $_ }) -join ' ')
+            Ok ("/dev/mtd0 可读，前 4 字节: " + $res.DdHead)
+        } else {
+            Warn "/dev/mtd0 读不了（exit $($d.Code)）"
+        }
+        return $res
+    }
+
     # 1) 能力探测
     Step '探测设备可用的命令'
     $capCmd = 'for t in wget wc dd md5sum sha512sum insmod chmod devmem devmem2 mtd; do if command -v $t >/dev/null 2>&1; then echo "$t=1"; else echo "$t=0"; fi; done'
@@ -644,6 +689,9 @@ try {
                else { 'openwrt-bcm53xx-generic-meraki_mx64-initramfs.bin' }
 
     if ($Check) {
+        # -Check 顺带跑 mtd 工具验证（原 -Probe 的内容），仍然不擦不写
+        $mtdTest = Test-MtdTool
+
         $transName = if ($variant -eq 'a0') { 'openwrt-bcm5862x-generic-meraki_mx64a0-initramfs-kernel.bin' }
                      else { 'openwrt-bcm5862x-generic-meraki_mx64-initramfs-kernel.bin' }
         $sysPat = if ($variant -eq 'a0') { 'openwrt-*-meraki_mx64-a0-squashfs.sysupgrade.bin' }
@@ -653,6 +701,15 @@ try {
         $sysName = if ($sysCand) { $sysCand.Name } else { "（files/ 里没有 $sysPat）" }
         $needTrans = ($target -eq 'uboot_mx64_small')
 
+        $mtdToolTxt =
+            if (-not $mtdTest.Downloaded) { '没验证（mtd 下载失败）' }
+            elseif (-not $mtdTest.RunOk) { '跑不起来（uClibc/AArch 不匹配）' }
+            else {
+                $argTxt = if ($mtdTest.UnlockArg) { "unlock 认 $($mtdTest.UnlockArg)" } else { 'unlock 打不开 mtd0（只读或节点缺失）' }
+                $ddTxt = if ($mtdTest.DdOk) { "dd 直读 $($mtdTest.DdHead)" } else { 'dd 直读失败' }
+                "可执行，$argTxt，$ddTxt"
+            }
+
         Write-Host ''
         Rule 'DarkYellow'
         Write-Host '  -Check：结论如下，什么都没写' -ForegroundColor Yellow
@@ -660,6 +717,7 @@ try {
         KeyVal 'SoC'       $(if ($variant -eq 'a0') { 'A0' } elseif ($variant -eq 'b0') { 'B0+' } else { '未知（按 B0+ 处理）' })
         KeyVal 'mtd0'      ("0x{0} ({1} 字节)" -f $mtd0Hex, $mtd0Size)
         KeyVal 'DevNodes'  $mtdNodes
+        KeyVal 'MtdTool'   $mtdToolTxt
         KeyVal 'Target'    $target
         KeyVal 'Unlock'    $(if (-not $needUnlock) { '不需要（直接 dd）' } elseif ($rwLoaded) { '已解锁（mtd_rw 已在运行，直接 mtd write）' } else { '需要（insmod mtd-rw.ko + mtd write）' })
         if ($needTrans) {
@@ -688,35 +746,9 @@ try {
         return
     }
 
-    # 5b) -Probe：安全地验证 mtd 工具（只跑 unlock，不擦不写）
+    # 5b) -Probe：只跑 mtd 工具验证（-Check 已包含，保留兼容）
     if ($Probe) {
-        Step '下载 mtd 工具'
-        $r = Invoke-Fetch 'mtd' -Exec -TimeoutSec 120
-        if ($r.Code -ne 0) {
-            Bad "mtd 下载失败: $((($r.Output -split "`n") | Where-Object { $_.Trim() }) -join ' | ')"
-            throw '下载失败'
-        }
-        Ok 'mtd 已下载'
-
-        Step './mtd（确认能跑起来，动态库齐全）'
-        $u = Invoke-Dev 'cd /tmp && ./mtd 2>&1' -TimeoutSec 60
-        ($u.Output -split "`n") | Where-Object { $_.Trim() } | ForEach-Object { Note ("  " + $_.Trim()) }
-        if ($u.Output -match 'Usage: mtd') { Ok 'mtd 可以执行' } else { Bad 'mtd 跑不起来（可能是 uClibc 版本/AArch 不对）' }
-
-        # unlock 只是清 flash 的保护位，不擦不写，拿来试参数名最安全
-        Step '试参数名：./mtd unlock <arg>'
-        foreach ($arg in @('/dev/mtd0', 'mtd0', 'boot', '__nope__')) {
-            $p = Invoke-Dev "cd /tmp && ./mtd unlock $arg 2>&1" -TimeoutSec 60
-            $txt = (($p.Output -split "`n") | Where-Object { $_.Trim() }) -join ' | '
-            if ($p.Output -match 'Could not open mtd device') { Warn "  $arg -> $txt（不认这个写法）" }
-            else { Ok "  $arg -> $txt" }
-        }
-
-        Step 'dd 直读 /dev/mtd0（备用通路）'
-        $d = Invoke-Dev 'dd if=/dev/mtd0 bs=4 count=1 2>&1' -TimeoutSec 60 -Binary
-        if ($d.Code -eq 0 -and $d.Bytes.Length -ge 4) {
-            Ok ("/dev/mtd0 可读，前 4 字节: " + (($d.Bytes[0..3] | ForEach-Object { '{0:x2}' -f $_ }) -join ' '))
-        } else { Warn "/dev/mtd0 读不了（exit $($d.Code)）" }
+        Test-MtdTool | Out-Null
 
         Rule 'DarkYellow'
         Note 'Probe 结束：没有擦除、没有写入'

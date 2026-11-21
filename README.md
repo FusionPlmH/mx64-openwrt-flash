@@ -32,9 +32,8 @@ A0 / B0+ 由脚本读 `devmem 0x18000000` 自动判断（`0x3F00`–`0x3F03` 为
 2. PC 网卡与设备同网段（默认 `192.168.1.2/24`），网线插 LAN 口
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -DryRun   # 只看计划
-powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Check    # 只读设备、出结论，不写 NAND
-powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Probe    # 只验证 mtd 工具，不擦不写
+powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -DryRun   # 只看计划，不碰设备
+powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1 -Check    # 只读体检：环境 + 设备探测 + mtd 工具验证，不写 NAND
 powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1           # 真刷
 ```
 
@@ -47,21 +46,19 @@ powershell -ExecutionPolicy Bypass -File scripts\00-flash.ps1           # 真刷
 5. 设备一上线就关掉 HTTP/TFTP，并打印 `Boot via` 说明这次走的是 U 盘还是 TFTP
 6. `scp` 上传 sysupgrade → `ssh sysupgrade -n` → 等系统重启回来
 
-`-ServerIp` 不指定时自动选本机 `192.168.1.x` 地址。网卡没有同网段地址时，按脚本提示用
+设备地址固定 `192.168.1.1`，PC 地址默认自动选本机 `192.168.1.x`。网卡没有同网段地址时，按脚本提示用
 `New-NetIPAddress` 加一个。
 
 ### 常用开关
 
 | 开关 | 作用 |
 |---|---|
-| `-Check` / `-Probe` / `-DryRun` | 只出结论 / 只验证 `mtd` 工具 / 只打印计划 |
+| `-Check` | 只读体检：环境检查 + 设备探测 + `mtd` 工具验证（含 `unlock` 参数），不写 NAND |
+| `-DryRun` | 只打印计划，不碰设备 |
 | `-SkipSysupgrade` | 进了 initramfs 就停，不装进 NAND |
 | `-Uboot clayface` | 改刷 clayface 的 `uboot_mx64`（默认 `uboot_ng.bin`） |
 | `-NoTftp` | 不起 TFTP，只留 U 盘一条路（UDP 69 被占用时） |
 | `-WarmReboot` | 先试软重启（实测多半起不来），90 秒后仍提示拔电 |
-| `-BootTimeoutSec <秒>` | 冷启动后等设备上线的超时，默认 900 |
-| `-SysupgradeFile <路径>` | 指定 sysupgrade 镜像（默认按 A0/B0+ 自动挑最新的） |
-| `-ServerIp` / `-DeviceIp` / `-Port` | PC 地址（自动探测）/ 设备地址 / HTTP 端口 `8000` |
 
 ### 必须拔电冷启动
 
