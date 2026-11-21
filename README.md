@@ -183,14 +183,6 @@ sync
 
 </details>
 
-## 确认设备现在处于哪一步
-
-```sh
-cat /proc/cmdline             # root=/dev/ubiblock0_0 = 已装进 NAND；/dev/ram0 = 还在 RAM
-df -h /overlay                # 有 /overlay 且几百 MB = sysupgrade 过了
-ubinfo -a                     # 有 rootfs_data 卷 = 已装好
-```
-
 ## 目录内容
 
 ```
