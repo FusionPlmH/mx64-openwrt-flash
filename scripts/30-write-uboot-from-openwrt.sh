@@ -9,7 +9,7 @@
 #     mtd: Could not open mtd device: /dev/mtd0
 #
 # 这种机器只能让 U-Boot 自己刷自己 —— 见 README
-# 「需要刷 mtd0 时：让 U-Boot 自己刷自己」。
+# 「进了 OpenWrt 之后重新刷 U-Boot」。
 #
 # 用法（设备上，ssh root@<设备IP>）：
 #   sh 30-write-uboot-from-openwrt.sh              # 用过渡固件自带的 /root/uboot_mx64
@@ -45,7 +45,7 @@ if ! dd if=/dev/zero of=/dev/mtd0 bs=1 count=0 2>/dev/null; then
 	echo "     2) 把它写进 mtd3 (u-boot-env)，TFTP 服务端跑着，然后断电重启"
 	echo "     3) U-Boot 会自己 TFTP 拉镜像、校验、写 mtd0、回读 CRC"
 	echo
-	echo "   详见 README「需要刷 mtd0 时：让 U-Boot 自己刷自己」"
+	echo "   详见 README「进了 OpenWrt 之后重新刷 U-Boot」"
 	exit 1
 fi
 echo "   mtd0 可写，继续"
@@ -69,4 +69,4 @@ echo "   两行相同即写入成功"
 
 echo
 echo "== 完成 =="
-echo "   下一步直接做 sysupgrade（README 第 7 节），不要单独 reboot 去测 U-Boot"
+echo "   下一步直接做 sysupgrade（README「sysupgrade 装进 NAND」），不要单独 reboot 去测 U-Boot"

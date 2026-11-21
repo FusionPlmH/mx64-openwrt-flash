@@ -180,7 +180,7 @@ KeyVal 'Server'     "$ServerIp  (diag 下载走 $Transport)"
 KeyVal 'Boot'       $(if ($NoTftp) { 'U 盘冷启动（-NoTftp，不起 TFTP）' } elseif ($BootMedia -eq 'tftp') { 'TFTP 自动取 initramfs（不提示 U 盘）' } else { 'U 盘 + TFTP 双通道（U-Boot 自己选，先 USB 再 TFTP）' })
 KeyVal 'U-Boot'     $(if ($Uboot -eq 'ng') { 'uboot_ng.bin（本项目，需 1 MiB 分区）' } else { 'clayface uboot_mx64 / uboot_mx64_small（按 mtd0 自动选）' })
 KeyVal 'Sysupgrade' $(if ($SkipSysupgrade) { '跳过' } elseif ($SysupgradeFile) { $SysupgradeFile } else { '自动选最新的（按 A0/B0+ 匹配）' })
-KeyVal 'Backup'     '跳过（默认）。要备份见 README 第 8 节，在 initramfs 里用 scp 拉'
+KeyVal 'Backup'     '跳过（默认）。要备份见 README「可选步骤」，在 initramfs 里用 scp 拉'
 KeyVal 'Mode'       $(if ($Check) { '仅检测（不写 NAND）' } elseif ($Probe) { '仅探测 mtd 工具（不擦不写）' } elseif ($DryRun) { '只看计划' } else { '真刷' })
 
 if ($DryRun) {
@@ -428,7 +428,7 @@ try {
             Ok "$DeviceIp`:22 开着，说明 OpenWrt 已经装好了 —— 这个脚本没事可做"
             Note "如果只是想确认系统状态：ssh root@$DeviceIp"
             Note '如果是要换 U-Boot：mtd0 在 OpenWrt 下是只读的，得让 U-Boot 自己刷自己 ——'
-            Note '  见 README「mtd0 写不进去时，改 U-Boot 环境」和「需要刷 mtd0 时：让 U-Boot 自己刷自己」'
+            Note '  见 README「进了 OpenWrt 之后重新刷 U-Boot」'
             throw "OpenWrt 已安装，跳过刷机"
         }
         if (-not $found) {
