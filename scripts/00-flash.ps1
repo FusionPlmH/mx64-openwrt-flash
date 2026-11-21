@@ -40,7 +40,7 @@ param(
     [ValidateSet('ng', 'clayface')]
     [string]$Uboot = 'ng',
     [string]$SysupgradeFile = '',
-    [int]$BootTimeoutSec = 900,
+    [int]$BootTimeoutSec = 300,
     [int]$HintSec = 120,
     [int]$SshTimeoutSec = 240,
     [switch]$Check,
@@ -953,7 +953,7 @@ try {
     $warmHinted = $false
     $hinted = $false
     $booted = $false
-    while (((Get-Date) - $t0).TotalSeconds -lt $BootTimeoutSec) {
+    while ($true) {
         $el = [int]((Get-Date) - $t0).TotalSeconds
 
         if ($needTftp -and (Test-Path $tftpLog)) {
@@ -1015,26 +1015,45 @@ try {
                      else { '等设备启动（USB/TFTP 都会试）' }
             Note ("  {0,4}s  {1}" -f $el, $state)
         }
-        Start-Sleep -Milliseconds 1000
-    }
 
-    if (-not $booted) {
-        Bad ("等了 $BootTimeoutSec 秒，$DeviceIp`:22 还是连不上")
-        Note 'mtd0 里确实写进了 U-Boot（整镜像逐字节回读一致），所以问题在"没冷启动"或"两种恢复路径都没成功"'
-        if ($tftpDone) {
-            Warn "TFTP 已经把 $tftpFile 传完，但系统没起来（内核/DTB 与 SoC 版本不匹配？）"
-            Note '接串口看 bootm/bootbk 之后的输出'
-        } elseif ($sawTftp) {
-            Warn 'TFTP 收到过请求但没传完 —— 多半是链路/丢包，或服务端被防火墙拦'
-            Note '先拔电重上电再试一次；仍不行接串口'
-        } else {
-            Note '全程没有 TFTP 请求，说明 U-Boot 没走到网络那一步'
-            Note '先只做一件事：拔电源 -> 插 U 盘 -> 插电源，盯前面板的灯看一遍'
-            Note '白灯一次都不闪 => 只能接串口 J1 查（115200 8N1, 3.3V TTL）'
+        if ($el -ge $BootTimeoutSec) {
+            Bad ("等了 $BootTimeoutSec 秒，$DeviceIp`:22 还是连不上")
+            Note 'mtd0 里确实写进了 U-Boot（整镜像逐字节回读一致），所以问题在"没冷启动"或"两种恢复路径都没成功"'
+            if ($tftpDone) {
+                Warn "TFTP 已经把 $tftpFile 传完，但系统没起来（内核/DTB 与 SoC 版本不匹配？）"
+                Note '接串口看 bootm/bootbk 之后的输出'
+            } elseif ($sawTftp) {
+                Warn 'TFTP 收到过请求但没传完 —— 多半是链路/丢包，或服务端被防火墙拦'
+                Note '先拔电重上电再试一次；仍不行接串口'
+            } else {
+                Note '全程没有 TFTP 请求，说明 U-Boot 没走到网络那一步'
+                Note '先只做一件事：拔电源 -> 插 U 盘 -> 插电源，盯前面板的灯看一遍'
+                Note '白灯一次都不闪 => 只能接串口 J1 查（115200 8N1, 3.3V TTL）'
+            }
+
+            # 超时不一定代表失败（可能只是人工操作慢了），问一下要不要再等一轮
+            $again = $false
+            if (-not [Console]::IsInputRedirected) {
+                try {
+                    $ans = Read-Host "  再等 $BootTimeoutSec 秒？[Y/n]（n = 退出）"
+                    $again = ($ans -notmatch '^\s*(n|no|q|quit|exit|退出)\s*$')
+                } catch {
+                    $again = $false
+                }
+            }
+            if (-not $again) {
+                $keepServers = $false
+                Note '已退出。mtd0 里已经是新 U-Boot，重新跑本脚本会接着往下走。'
+                throw '第 4 阶段失败'
+            }
+            Note "继续等，再给 $BootTimeoutSec 秒"
+            Write-Host ''
+            $t0 = Get-Date
+            $hinted = $false
+            continue
         }
-        # 别把服务关掉：超时可能只是人工操作慢，用户想马上再试一次
-        $keepServers = $true
-        throw '第 4 阶段失败'
+
+        Start-Sleep -Milliseconds 1000
     }
 
     # 判断这次到底是哪条路进来的（只靠 TFTP 日志 + 是否插了 U 盘无法区分 USB/UBI）
