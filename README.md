@@ -1,8 +1,7 @@
 # Meraki MX64 / MX64W → OpenWrt 刷机包
 
 按 <https://openwrt.org/toh/meraki/mx64> 整理的 **PC 侧全自动**刷机流程：判断、校验、比对都在笔记本上做，
-设备只执行原始 shell 命令（`cat` / `wget` / `dd` …），不往设备里塞脚本——原厂 diagnostic mode 的
-busybox 1.7.2 连 `sed` / `awk` 都没有。
+设备只执行原始 shell 命令（`cat` / `wget` / `dd` …）
 
 - **设备**：`192.168.1.1`，网线插 LAN1-4（不是 WAN）
 - **PC**：`192.168.1.2`（自动探测同网段地址）
@@ -73,7 +72,7 @@ PC 地址默认自动选本机 `192.168.1.x`；网卡没有同网段地址时，
 > **必须拔电冷启动。** 写完 mtd0 再发 `reboot`，两台真机都回不来（常亮橙、网络全死）；
 > 拔电源冷启动约 77 秒进 initramfs。只有第一次刷 U-Boot 需要按 reset 进 diag，之后都不用。
 
-### U 盘（可选）
+### U 盘（建议）
 
 TFTP 覆盖同样的路径，**不插 U 盘也能起**；U-Boot 顺序是 UBI → USB → TFTP。
 
@@ -99,7 +98,7 @@ powershell -ExecutionPolicy Bypass -File scripts\01-serve-http.ps1   # HTTP :800
 python scripts\70-tftp-server.py                                     # 可选，TFTP :69（Windows 不需要管理员）
 ```
 
-### 2. 设备上执行
+### 2. PC 上执行
 
 `telnet 192.168.1.1` 进去后：
 
