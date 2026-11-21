@@ -79,7 +79,7 @@ function Rule { param([string]$Color = 'DarkGray') Write-Host ('-' * 68) -Foregr
 function Banner {
     Write-Host ''
     Write-Host '  +----------------------------------------------------------------+' -ForegroundColor DarkCyan
-    Write-Host '  |  Meraki MX64 / MX64W  ->  OpenWrt                               |' -ForegroundColor DarkCyan
+    Write-Host '  |  Meraki MX64  ->  OpenWrt                                        |' -ForegroundColor DarkCyan
     Write-Host '  |  全部逻辑在 PC 侧，设备上不落脚本                                |' -ForegroundColor DarkCyan
     Write-Host '  +----------------------------------------------------------------+' -ForegroundColor DarkCyan
 }

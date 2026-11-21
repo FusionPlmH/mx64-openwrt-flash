@@ -1,4 +1,4 @@
-# Meraki MX64 / MX64W → OpenWrt 刷机包
+# Meraki MX64 → OpenWrt 刷机包
 
 按 <https://openwrt.org/toh/meraki/mx64> 整理的 **PC 侧全自动**刷机流程：判断、校验、比对都在笔记本上做，
 设备只执行原始 shell 命令（`cat` / `wget` / `dd` …）
@@ -8,9 +8,20 @@
 - **仓库**：<https://github.com/FusionPlmH/mx64-openwrt-flash>
 - **U-Boot 源码**：<https://github.com/FusionPlmH/mx64-uboot-refresh>
 
-> **只支持 `mtd0` = 1 MiB（`00100000`）的机器**——绝大多数 MX64/MX64W 都是。
+> **只支持 `mtd0` = 1 MiB（`00100000`）的机器**——绝大多数 MX64 都是。
 > `00080000`（512 KiB）的机器不在支持范围内，脚本检测到会直接停下。
 > A0 / B0+ 由脚本读 `devmem 0x18000000` 自动判断（`0x3F00`–`0x3F03` 为 A0），镜像选错内核起不来。
+
+## 开始之前
+
+先把整个仓库下载到本地——脚本和 `files/` 里的镜像都在里面，缺一不可：
+
+```powershell
+git clone https://github.com/FusionPlmH/mx64-openwrt-flash.git
+cd mx64-openwrt-flash
+```
+
+没有 `git` 就在仓库页面点 **Code → Download ZIP** 解压。下面所有命令都在这个目录里执行。
 
 ## 刷机路线
 
